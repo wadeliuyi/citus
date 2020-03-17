@@ -629,11 +629,12 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 									 NULL, NULL);
 			}
 
-			if (cteQuery->hasForUpdate)
+			if (cteQuery->hasForUpdate &&
+				FindNodeCheckInRangeTableList(cteQuery->rtable, IsReferenceTableRTE))
 			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 									 "Router planner doesn't support SELECT FOR UPDATE"
-									 " in common table expressions.",
+									 " in common table expressions involving reference tables.",
 									 NULL, NULL);
 			}
 
