@@ -155,13 +155,10 @@ static ShardPlacement * CreateDummyPlacement(void);
 static List * get_all_actual_clauses(List *restrictinfo_list);
 static int CompareInsertValuesByShardId(const void *leftElement,
 										const void *rightElement);
-static List * SingleShardSelectTaskList(Query *query, uint64 jobId,
-										List *relationShardList, List *placementList,
-										uint64 shardId, bool parametersInQueryResolved);
+static List * SingleShardTaskList(Query *query, uint64 jobId,
+								  List *relationShardList, List *placementList,
+								  uint64 shardId, bool parametersInQueryResolved);
 static bool RowLocksOnRelations(Node *node, List **rtiLockList);
-static List * SingleShardModifyTaskList(Query *query, uint64 jobId,
-										List *relationShardList, List *placementList,
-										uint64 shardId, bool parametersInQueryResolved);
 static List * RemoveCoordinatorPlacement(List *placementList);
 static void ReorderTaskPlacementsByTaskAssignmentPolicy(Job *job,
 														TaskAssignmentPolicyType
@@ -1666,10 +1663,10 @@ GenerateSingleShardRouterTaskList(Job *job, List *relationShardList,
 
 	if (originalQuery->commandType == CMD_SELECT)
 	{
-		job->taskList = SingleShardSelectTaskList(originalQuery, job->jobId,
-												  relationShardList, placementList,
-												  shardId,
-												  job->parametersInJobQueryResolved);
+		job->taskList = SingleShardTaskList(originalQuery, job->jobId,
+											relationShardList, placementList,
+											shardId,
+											job->parametersInJobQueryResolved);
 
 		/*
 		 * Queries to reference tables, or distributed tables with multiple replica's have
@@ -1693,10 +1690,10 @@ GenerateSingleShardRouterTaskList(Job *job, List *relationShardList,
 	}
 	else
 	{
-		job->taskList = SingleShardModifyTaskList(originalQuery, job->jobId,
-												  relationShardList, placementList,
-												  shardId,
-												  job->parametersInJobQueryResolved);
+		job->taskList = SingleShardTaskList(originalQuery, job->jobId,
+											relationShardList, placementList,
+											shardId,
+											job->parametersInJobQueryResolved);
 	}
 }
 
@@ -1783,16 +1780,40 @@ RemoveCoordinatorPlacement(List *placementList)
 
 
 /*
- * SingleShardSelectTaskList generates a task for single shard select query
+ * SingleShardTaskList generates a task for single shard query
  * and returns it as a list.
  */
 static List *
-SingleShardSelectTaskList(Query *query, uint64 jobId, List *relationShardList,
-						  List *placementList, uint64 shardId,
-						  bool parametersInQueryResolved)
+SingleShardTaskList(Query *query, uint64 jobId, List *relationShardList,
+					List *placementList, uint64 shardId,
+					bool parametersInQueryResolved)
 {
 	TaskType taskType = READ_TASK;
 	char replicationModel = 0;
+
+	if (query->commandType != CMD_SELECT)
+	{
+		List *rangeTableList = NIL;
+		ExtractRangeTableEntryWalker((Node *) query, &rangeTableList);
+
+		RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(query);
+		Assert(updateOrDeleteRTE != NULL);
+
+		CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
+			updateOrDeleteRTE->relid);
+		char modificationPartitionMethod = modificationTableCacheEntry->partitionMethod;
+
+		if (modificationPartitionMethod == DISTRIBUTE_BY_NONE &&
+			SelectsFromDistributedTable(rangeTableList, query))
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot perform select on a distributed table "
+								   "and modify a reference table")));
+		}
+
+		taskType = MODIFY_TASK;
+		replicationModel = modificationTableCacheEntry->replicationModel;
+	}
 
 	CommonTableExpr *cte = NULL;
 	foreach_ptr(cte, query->cteList)
@@ -1802,7 +1823,7 @@ SingleShardSelectTaskList(Query *query, uint64 jobId, List *relationShardList,
 		if (cteQuery->commandType != CMD_SELECT)
 		{
 			/* These test could be asserts */
-			RangeTblEntry *updateOrDeleteRTE = GetUpdateOrDeleteRTE(cteQuery);
+			RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(cteQuery);
 			CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
 				updateOrDeleteRTE->relid);
 			char modificationPartitionMethod =
@@ -3297,7 +3318,7 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 
 		if (cteQuery->commandType != CMD_SELECT)
 		{
-			RangeTblEntry *updateOrDeleteRTE = GetUpdateOrDeleteRTE(cteQuery);
+			RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(cteQuery);
 			CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
 				updateOrDeleteRTE->relid);
 			char modificationPartitionMethod =
