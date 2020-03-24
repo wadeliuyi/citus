@@ -1704,7 +1704,6 @@ AssignTasksToConnectionsOrWorkerPool(DistributedExecution *execution)
 												sizeof(TaskPlacementExecution *));
 		shardCommandExecution->placementExecutionCount = placementExecutionCount;
 
-		/* TODO yes if select with modifying cte */
 		shardCommandExecution->expectResults =
 			expectResults && !task->partiallyLocalOrRemote;
 
