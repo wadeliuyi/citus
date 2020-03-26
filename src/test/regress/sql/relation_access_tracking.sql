@@ -549,6 +549,7 @@ ROLLBACK;
 
 -- modifying CTEs should work fine with sequential mode
 BEGIN;
+	SET LOCAL citus.multi_shard_modify_mode = 'sequential';
 
 	WITH cte_1 AS (UPDATE table_1 SET value = 15 RETURNING *)
 	SELECT count(*) FROM cte_1 ORDER BY 1;

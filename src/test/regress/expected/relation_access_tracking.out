@@ -949,6 +949,7 @@ BEGIN;
 ROLLBACK;
 -- modifying CTEs should work fine with sequential mode
 BEGIN;
+	SET LOCAL citus.multi_shard_modify_mode = 'sequential';
 	WITH cte_1 AS (UPDATE table_1 SET value = 15 RETURNING *)
 	SELECT count(*) FROM cte_1 ORDER BY 1;
  count
@@ -957,9 +958,9 @@ BEGIN;
 (1 row)
 
 	SELECT * FROM relation_acesses  WHERE table_name IN ('table_1')  ORDER BY 1;
- table_name |  select_access  |   dml_access    |      ddl_access
+ table_name |     select_access     |      dml_access       |      ddl_access
 ---------------------------------------------------------------------
- table_1    | parallel_access | parallel_access | not_parallel_accessed
+ table_1    | not_parallel_accessed | not_parallel_accessed | not_parallel_accessed
 (1 row)
 
 ROLLBACK;
