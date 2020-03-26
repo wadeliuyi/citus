@@ -964,6 +964,39 @@ BEGIN;
 (1 row)
 
 ROLLBACK;
+-- router planned modifying CTEs should work fine with parallel mode
+BEGIN;
+	WITH cte_1 AS (UPDATE table_1 SET value = 15 WHERE key = 6 RETURNING *)
+	SELECT count(*) FROM cte_1 ORDER BY 1;
+ count
+---------------------------------------------------------------------
+     1
+(1 row)
+
+	SELECT * FROM relation_accesses  WHERE table_name IN ('table_1')  ORDER BY 1;
+ table_name |     select_access     |      dml_access       |      ddl_access
+---------------------------------------------------------------------
+ table_1    | not_parallel_accessed | not_parallel_accessed | not_parallel_accessed
+(1 row)
+
+ROLLBACK;
+-- router planned modifying CTEs should work fine with sequential mode
+BEGIN;
+	SET LOCAL citus.multi_shard_modify_mode = 'sequential';
+	WITH cte_1 AS (UPDATE table_1 SET value = 15 WHERE key = 6 RETURNING *)
+	SELECT count(*) FROM cte_1 ORDER BY 1;
+ count
+---------------------------------------------------------------------
+     1
+(1 row)
+
+	SELECT * FROM relation_accesses  WHERE table_name IN ('table_1')  ORDER BY 1;
+ table_name |     select_access     |      dml_access       |      ddl_access
+---------------------------------------------------------------------
+ table_1    | not_parallel_accessed | not_parallel_accessed | not_parallel_accessed
+(1 row)
+
+ROLLBACK;
 -- create distributed table with data loading
 -- should mark both parallel dml and parallel ddl
 DROP TABLE table_3;
