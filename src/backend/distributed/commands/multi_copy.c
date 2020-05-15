@@ -247,9 +247,15 @@ static CopyShardState * GetShardState(uint64 shardId, HTAB *shardStateHash,
 									  HTAB *connectionStateHash, bool stopOnFailure,
 									  bool *found, bool shouldUseLocalCopy, CopyOutState
 									  copyOutState, bool isCopyToIntermediateFile);
-static MultiConnection * CopyGetPlacementConnection(ShardPlacement *placement,
+static MultiConnection * CopyGetPlacementConnection(HTAB *connectionStateHash,
+													ShardPlacement *placement,
 													bool stopOnFailure);
+static MultiConnection * GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash,
+																char *nodeName,
+																int nodePort);
 static List * ConnectionStateList(HTAB *connectionStateHash);
+static List * ConnectionStateListToNode(HTAB *connectionStateHash,
+										char *hostname, int port);
 static void InitializeCopyShardState(CopyShardState *shardState,
 									 HTAB *connectionStateHash,
 									 uint64 shardId, bool stopOnFailure, bool
@@ -3263,6 +3269,36 @@ ConnectionStateList(HTAB *connectionStateHash)
 
 
 /*
+ * ConnectionStateListToNode returns all CopyConnectionState structures in
+ * the given hash.
+ */
+static List *
+ConnectionStateListToNode(HTAB *connectionStateHash, char *hostname, int port)
+{
+	List *connectionStateList = NIL;
+	HASH_SEQ_STATUS status;
+
+	hash_seq_init(&status, connectionStateHash);
+
+	CopyConnectionState *connectionState =
+		(CopyConnectionState *) hash_seq_search(&status);
+	while (connectionState != NULL)
+	{
+		if (strncmp(connectionState->connection->hostname, hostname, MAX_NODE_LENGTH) ==
+			0 &&
+			connectionState->connection->port == port)
+		{
+			connectionStateList = lappend(connectionStateList, connectionState);
+		}
+
+		connectionState = (CopyConnectionState *) hash_seq_search(&status);
+	}
+
+	return connectionStateList;
+}
+
+
+/*
  * GetShardState finds existing CopyShardState for a shard in the provided
  * hash. If not found, then a new shard state is returned with all related
  * CopyPlacementStates initialized.
@@ -3347,7 +3383,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 		}
 
 		MultiConnection *connection =
-			CopyGetPlacementConnection(placement, stopOnFailure);
+			CopyGetPlacementConnection(connectionStateHash, placement, stopOnFailure);
 		if (connection == NULL)
 		{
 			failedPlacementCount++;
@@ -3444,7 +3480,8 @@ LogLocalCopyExecution(uint64 shardId)
  * then it reuses the connection. Otherwise, it requests a connection for placement.
  */
 static MultiConnection *
-CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
+CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement, bool
+						   stopOnFailure)
 {
 	uint32 connectionFlags = FOR_DML;
 	char *nodeUser = CurrentUserName();
@@ -3459,6 +3496,15 @@ CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
 																		 list_make1(
 																			 placementAccess),
 																		 NULL);
+	if (connection != NULL)
+	{
+		return connection;
+	}
+
+
+	connection =
+		GetConnectionIfExecutorPoolSizeReached(connectionStateHash, placement->nodeName,
+											   placement->nodePort);
 	if (connection != NULL)
 	{
 		return connection;
@@ -3503,6 +3549,51 @@ CopyGetPlacementConnection(ShardPlacement *placement, bool stopOnFailure)
 	if (MultiShardConnectionType != SEQUENTIAL_CONNECTION)
 	{
 		ClaimConnectionExclusively(connection);
+	}
+
+	return connection;
+}
+
+
+static MultiConnection *
+GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash, char *nodeName, int
+									   nodePort)
+{
+	List *connectionStateList =
+		ConnectionStateListToNode(connectionStateHash, nodeName, nodePort);
+
+	if (list_length(connectionStateList) < MaxAdaptiveExecutorPoolSize)
+	{
+		return NULL;
+	}
+
+	MultiConnection *connection = NULL;
+	int minPlacementCount = INT32_MAX;
+	ListCell *connectionStateCell = NULL;
+
+	foreach(connectionStateCell, connectionStateList)
+	{
+		CopyConnectionState *connectionState = lfirst(connectionStateCell);
+		int currentConnectionPlacementCount = 0;
+
+		if (connectionState->activePlacementState != NULL)
+		{
+			currentConnectionPlacementCount++;
+		}
+
+		dlist_iter iter;
+		dlist_foreach(iter, &connectionState->bufferedPlacementList)
+		{
+			currentConnectionPlacementCount++;
+		}
+
+		Assert(currentConnectionPlacementCount > 0);
+
+		if (currentConnectionPlacementCount < minPlacementCount)
+		{
+			minPlacementCount = currentConnectionPlacementCount;
+			connection = connectionState->connection;
+		}
 	}
 
 	return connection;
