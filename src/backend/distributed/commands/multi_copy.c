@@ -3556,6 +3556,11 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 	{
 		connection =
 			GetLeastUtilisedCopyConnection(connectionStateList, nodeName, nodePort);
+
+		/*
+		 * If we've already reached the executor pool size, there should be at
+		 * least oone connection to any given node.
+		 */
 		Assert(connection != NULL);
 
 		return connection;
@@ -3628,9 +3633,8 @@ HasReachedAdaptiveExecutorPoolSize(List *connectionStateList)
 
 
 /*
- * GetLeastUtilisedCopyConnection returns a MultiConnection if the total
- * number of connections that the current COPY command exceeded
- * citus.max_adaptive_executor_pool_size. If not, the function return NULL.
+ * GetLeastUtilisedCopyConnection returns a MultiConnection to the given node
+ * with the least number of placements assigned to it.
  */
 static MultiConnection *
 GetLeastUtilisedCopyConnection(List *connectionStateList, char *nodeName,
