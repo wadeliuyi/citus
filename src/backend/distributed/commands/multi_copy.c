@@ -155,6 +155,9 @@ typedef struct CopyConnectionState
 	 * In this case, old activePlacementState isn't NULL, is added to this list.
 	 */
 	dlist_head bufferedPlacementList;
+
+	/* length of bufferedPlacementList, to avoid iterations over the list when needed */
+	int bufferedPlacementCount;
 } CopyConnectionState;
 
 
@@ -288,6 +291,14 @@ static void CopyAttributeOutText(CopyOutState outputState, char *string);
 static inline void CopyFlushOutput(CopyOutState outputState, char *start, char *pointer);
 static bool CitusSendTupleToPlacements(TupleTableSlot *slot,
 									   CitusCopyDestReceiver *copyDest);
+static void AddPlacementStateToCopyConnectionStateBuffer(CopyConnectionState *
+														 connectionState,
+														 CopyPlacementState *
+														 placementState);
+static void RemovePlacementStateFromCopyConnectionStateBuffer(CopyConnectionState *
+															  connectionState,
+															  CopyPlacementState *
+															  placementState);
 static uint64 ShardIdForTuple(CitusCopyDestReceiver *copyDest, Datum *columnValues,
 							  bool *columnNulls);
 
@@ -2354,8 +2365,8 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 
 			/* before switching, make sure to finish the copy */
 			EndPlacementStateCopyCommand(activePlacementState, copyOutState);
-			dlist_push_head(&connectionState->bufferedPlacementList,
-							&activePlacementState->bufferedPlacementNode);
+			AddPlacementStateToCopyConnectionStateBuffer(connectionState,
+														 activePlacementState);
 		}
 
 		if (switchToCurrentPlacement)
@@ -2363,7 +2374,9 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 			StartPlacementStateCopyCommand(currentPlacementState, copyStatement,
 										   copyOutState);
 
-			dlist_delete(&currentPlacementState->bufferedPlacementNode);
+			RemovePlacementStateFromCopyConnectionStateBuffer(connectionState,
+															  currentPlacementState);
+
 			connectionState->activePlacementState = currentPlacementState;
 
 			/* send previously buffered tuples */
@@ -2414,6 +2427,35 @@ CitusSendTupleToPlacements(TupleTableSlot *slot, CitusCopyDestReceiver *copyDest
 	ResetPerTupleExprContext(executorState);
 
 	return true;
+}
+
+
+/*
+ * AddPlacementStateToCopyConnectionStateBuffer is a helper function to add a placement
+ * state to connection state's placement buffer. In addition to that, keep the counter
+ * up to date.
+ */
+static void
+AddPlacementStateToCopyConnectionStateBuffer(CopyConnectionState *connectionState,
+											 CopyPlacementState *placementState)
+{
+	dlist_push_head(&connectionState->bufferedPlacementList,
+					&placementState->bufferedPlacementNode);
+	connectionState->bufferedPlacementCount++;
+}
+
+
+/*
+ * RemovePlacementStateFromCopyConnectionStateBuffer is a helper function to removes a placement
+ * state frmo connection state's placement buffer. In addition to that, keep the counter
+ * up to date.
+ */
+static void
+RemovePlacementStateFromCopyConnectionStateBuffer(CopyConnectionState *connectionState,
+												  CopyPlacementState *placementState)
+{
+	dlist_delete(&placementState->bufferedPlacementNode);
+	connectionState->bufferedPlacementCount--;
 }
 
 
@@ -3236,6 +3278,7 @@ GetConnectionState(HTAB *connectionStateHash, MultiConnection *connection)
 		connectionState->socket = sock;
 		connectionState->connection = connection;
 		connectionState->activePlacementState = NULL;
+		connectionState->bufferedPlacementCount = 0;
 		dlist_init(&connectionState->bufferedPlacementList);
 	}
 
@@ -3415,8 +3458,7 @@ InitializeCopyShardState(CopyShardState *shardState,
 		 * same time as calling StartPlacementStateCopyCommand() so we actually
 		 * know the COPY operation for the placement is ongoing.
 		 */
-		dlist_push_head(&connectionState->bufferedPlacementList,
-						&placementState->bufferedPlacementNode);
+		AddPlacementStateToCopyConnectionStateBuffer(connectionState, placementState);
 		shardState->placementStateList = lappend(shardState->placementStateList,
 												 placementState);
 	}
@@ -3501,7 +3543,11 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 		return connection;
 	}
 
-
+	/*
+	 * If we exceeded citus.max_adaptive_executor_pool_size, we should re-use the
+	 * existing connections to multiplex multiple COPY commands on shards over a
+	 * single connection.
+	 */
 	connection =
 		GetConnectionIfExecutorPoolSizeReached(connectionStateHash, placement->nodeName,
 											   placement->nodePort);
@@ -3555,6 +3601,11 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 }
 
 
+/*
+ * GetConnectionIfExecutorPoolSizeReached returns a MultiConnection if the total
+ * number of connections that the current COPY command exceeded
+ * citus.max_adaptive_executor_pool_size. If not, the function return NULL.
+ */
 static MultiConnection *
 GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash, char *nodeName, int
 									   nodePort)
@@ -3564,6 +3615,11 @@ GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash, char *nodeName
 
 	if (list_length(connectionStateList) < MaxAdaptiveExecutorPoolSize)
 	{
+		/*
+		 * We've not reached MaxAdaptiveExecutorPoolSize number of
+		 * connections, so we'll establish a new connection to the
+		 * given node.
+		 */
 		return NULL;
 	}
 
@@ -3574,15 +3630,9 @@ GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash, char *nodeName
 	foreach(connectionStateCell, connectionStateList)
 	{
 		CopyConnectionState *connectionState = lfirst(connectionStateCell);
-		int currentConnectionPlacementCount = 0;
+		int currentConnectionPlacementCount = connectionState->bufferedPlacementCount;
 
 		if (connectionState->activePlacementState != NULL)
-		{
-			currentConnectionPlacementCount++;
-		}
-
-		dlist_iter iter;
-		dlist_foreach(iter, &connectionState->bufferedPlacementList)
 		{
 			currentConnectionPlacementCount++;
 		}
