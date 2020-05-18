@@ -253,9 +253,9 @@ static CopyShardState * GetShardState(uint64 shardId, HTAB *shardStateHash,
 static MultiConnection * CopyGetPlacementConnection(HTAB *connectionStateHash,
 													ShardPlacement *placement,
 													bool stopOnFailure);
-static MultiConnection * GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash,
-																char *nodeName,
-																int nodePort);
+static bool HasReachedAdaptiveExecutorPoolSize(List *connectionStateHash);
+static MultiConnection * GetLeastUtilisedCopyConnection(List *connectionStateList,
+														char *nodeName, int nodePort);
 static List * ConnectionStateList(HTAB *connectionStateHash);
 static List * ConnectionStateListToNode(HTAB *connectionStateHash,
 										char *hostname, int port);
@@ -3327,8 +3327,8 @@ ConnectionStateListToNode(HTAB *connectionStateHash, char *hostname, int port)
 		(CopyConnectionState *) hash_seq_search(&status);
 	while (connectionState != NULL)
 	{
-		if (strncmp(connectionState->connection->hostname, hostname, MAX_NODE_LENGTH) ==
-			0 &&
+		char *connectionHostname = connectionState->connection->hostname;
+		if (strncmp(connectionHostname, hostname, MAX_NODE_LENGTH) == 0 &&
 			connectionState->connection->port == port)
 		{
 			connectionStateList = lappend(connectionStateList, connectionState);
@@ -3548,11 +3548,16 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 	 * existing connections to multiplex multiple COPY commands on shards over a
 	 * single connection.
 	 */
-	connection =
-		GetConnectionIfExecutorPoolSizeReached(connectionStateHash, placement->nodeName,
-											   placement->nodePort);
-	if (connection != NULL)
+	char *nodeName = placement->nodeName;
+	int nodePort = placement->nodePort;
+	List *connectionStateList =
+		ConnectionStateListToNode(connectionStateHash, nodeName, nodePort);
+	if (HasReachedAdaptiveExecutorPoolSize(connectionStateList))
 	{
+		connection =
+			GetLeastUtilisedCopyConnection(connectionStateList, nodeName, nodePort);
+		Assert(connection != NULL);
+
 		return connection;
 	}
 
@@ -3602,27 +3607,35 @@ CopyGetPlacementConnection(HTAB *connectionStateHash, ShardPlacement *placement,
 
 
 /*
- * GetConnectionIfExecutorPoolSizeReached returns a MultiConnection if the total
+ * HasReachedAdaptiveExecutorPoolSize returns true if the input connection list has more
+ * entries than citus.max_adaptive_executor_pool_size.
+ */
+static bool
+HasReachedAdaptiveExecutorPoolSize(List *connectionStateList)
+{
+	if (list_length(connectionStateList) >= MaxAdaptiveExecutorPoolSize)
+	{
+		/*
+		 * We've not reached MaxAdaptiveExecutorPoolSize number of
+		 * connections, so we're allowed to establish a new
+		 * connection to the given node.
+		 */
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * GetLeastUtilisedCopyConnection returns a MultiConnection if the total
  * number of connections that the current COPY command exceeded
  * citus.max_adaptive_executor_pool_size. If not, the function return NULL.
  */
 static MultiConnection *
-GetConnectionIfExecutorPoolSizeReached(HTAB *connectionStateHash, char *nodeName, int
-									   nodePort)
+GetLeastUtilisedCopyConnection(List *connectionStateList, char *nodeName,
+							   int nodePort)
 {
-	List *connectionStateList =
-		ConnectionStateListToNode(connectionStateHash, nodeName, nodePort);
-
-	if (list_length(connectionStateList) < MaxAdaptiveExecutorPoolSize)
-	{
-		/*
-		 * We've not reached MaxAdaptiveExecutorPoolSize number of
-		 * connections, so we'll establish a new connection to the
-		 * given node.
-		 */
-		return NULL;
-	}
-
 	MultiConnection *connection = NULL;
 	int minPlacementCount = INT32_MAX;
 	ListCell *connectionStateCell = NULL;
