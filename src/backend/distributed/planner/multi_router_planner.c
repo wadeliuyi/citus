@@ -1823,7 +1823,10 @@ SingleShardTaskList(Query *query, uint64 jobId, List *relationShardList,
 
 		if (cteQuery->commandType != CMD_SELECT)
 		{
-			/* These test could be asserts */
+			/*
+			 * These tests could be asserts, as we should've already checked
+			 * with ErrorIfQueryHasUnroutableModifyingCTE.
+			 */
 			RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(cteQuery);
 			CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
 				updateOrDeleteRTE->relid);
