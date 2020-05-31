@@ -54,7 +54,7 @@ static Node * DelayedErrorCreateScan(CustomScan *scan);
 
 /* functions that are common to different scans */
 static void CitusBeginScan(CustomScanState *node, EState *estate, int eflags);
-static void CitusBeginSelectScan(CustomScanState *node, EState *estate, int eflags);
+static void CitusBeginReadOnlyScan(CustomScanState *node, EState *estate, int eflags);
 static void CitusBeginModifyScan(CustomScanState *node, EState *estate, int eflags);
 static void CitusPreExecScan(CitusScanState *scanState);
 static bool ModifyJobNeedsEvaluation(Job *workerJob);
@@ -206,7 +206,7 @@ CitusBeginScan(CustomScanState *node, EState *estate, int eflags)
 	}
 	else if (distributedPlan->modLevel == ROW_MODIFY_READONLY)
 	{
-		CitusBeginSelectScan(node, estate, eflags);
+		CitusBeginReadOnlyScan(node, estate, eflags);
 	}
 	else
 	{
@@ -248,13 +248,15 @@ CitusExecScan(CustomScanState *node)
 
 
 /*
- * CitusBeginSelectScan handles deferred pruning and plan caching for SELECTs.
+ * CitusBeginReadOnlyScan handles deferred pruning and plan caching for SELECTs.
  */
 static void
-CitusBeginSelectScan(CustomScanState *node, EState *estate, int eflags)
+CitusBeginReadOnlyScan(CustomScanState *node, EState *estate, int eflags)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	DistributedPlan *originalDistributedPlan = scanState->distributedPlan;
+
+	Assert(originalDistributedPlan->workerJob->jobQuery->commandType == CMD_SELECT);
 
 	if (!originalDistributedPlan->workerJob->deferredPruning)
 	{
@@ -345,8 +347,16 @@ CitusBeginModifyScan(CustomScanState *node, EState *estate, int eflags)
 
 	if (ModifyJobNeedsEvaluation(workerJob))
 	{
-		/* evaluate both functions and parameters */
-		ExecuteMasterEvaluableFunctionsAndParameters(jobQuery, planState);
+		if (jobQuery->commandType == CMD_SELECT)
+		{
+			/* only functions inside modifying CTEs will be evaluated */
+			ExecuteMasterEvaluableParameters(jobQuery, planState);
+		}
+		else
+		{
+			/* evaluate both functions and parameters */
+			ExecuteMasterEvaluableFunctionsAndParameters(jobQuery, planState);
+		}
 
 		/* job query no longer has parameters, so we should not send any */
 		workerJob->parametersInJobQueryResolved = true;

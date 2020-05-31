@@ -38,14 +38,14 @@ static bool ShouldEvaluateFunctionWithMasterContext(MasterEvaluationContext *
 													evaluationContext);
 
 /*
- * RequiresMastereEvaluation returns the executor needs to reparse and
+ * RequiresMasterEvaluation returns the executor needs to reparse and
  * try to execute this query, which is the case if the query contains
  * any stable or volatile function.
  */
 bool
 RequiresMasterEvaluation(Query *query)
 {
-	if (query->commandType == CMD_SELECT)
+	if (query->commandType == CMD_SELECT && !query->hasModifyingCTE)
 	{
 		return false;
 	}
@@ -146,9 +146,22 @@ PartiallyEvaluateExpression(Node *expression,
 	}
 	else if (nodeTag == T_Query)
 	{
-		return (Node *) query_tree_mutator((Query *) expression,
+		Query *query = (Query *) expression;
+		MasterEvaluationContext subContext = *masterEvaluationContext;
+		if (query->commandType != CMD_SELECT)
+		{
+			/*
+			 * Currently INSERT SELECT evaluates stable functions on master,
+			 * while a plain SELECT does not. For evaluating SELECT evaluationMode is
+			 * EVALUATE_PARAMS, but if recursing into a modifying CTE switch into
+			 * EVALUATE_FUNCTIONS_PARAMS.
+			 */
+			subContext.evaluationMode = EVALUATE_FUNCTIONS_PARAMS;
+		}
+
+		return (Node *) query_tree_mutator(query,
 										   PartiallyEvaluateExpression,
-										   masterEvaluationContext,
+										   &subContext,
 										   QTW_DONT_COPY_QUERY);
 	}
 	else
