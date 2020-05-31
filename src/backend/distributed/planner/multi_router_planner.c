@@ -1816,39 +1816,26 @@ SingleShardTaskList(Query *query, uint64 jobId, List *relationShardList,
 		replicationModel = modificationTableCacheEntry->replicationModel;
 	}
 
-	CommonTableExpr *cte = NULL;
-	foreach_ptr(cte, query->cteList)
+	if (taskType == READ_TASK && query->hasModifyingCTE)
 	{
-		Query *cteQuery = (Query *) cte->ctequery;
+		/* assume ErrorIfQueryHasUnroutableModifyingCTE checked query already */
 
-		if (cteQuery->commandType != CMD_SELECT)
+		CommonTableExpr *cte = NULL;
+		foreach_ptr(cte, query->cteList)
 		{
-			/*
-			 * These tests could be asserts, as we should've already checked
-			 * with ErrorIfQueryHasUnroutableModifyingCTE.
-			 */
-			RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(cteQuery);
-			CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
-				updateOrDeleteRTE->relid);
-			char modificationPartitionMethod =
-				modificationTableCacheEntry->partitionMethod;
+			Query *cteQuery = (Query *) cte->ctequery;
 
-			if (modificationPartitionMethod == DISTRIBUTE_BY_NONE)
+			if (cteQuery->commandType != CMD_SELECT)
 			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("cannot perform select on a distributed table "
-									   "and modify a reference table")));
-			}
+				RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(cteQuery);
+				CitusTableCacheEntry *modificationTableCacheEntry =
+					GetCitusTableCacheEntry(
+						updateOrDeleteRTE->relid);
 
-			if (replicationModel &&
-				modificationTableCacheEntry->replicationModel != replicationModel)
-			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("cannot route mixed replication models")));
+				taskType = MODIFY_TASK;
+				replicationModel = modificationTableCacheEntry->replicationModel;
+				break;
 			}
-
-			taskType = MODIFY_TASK;
-			replicationModel = modificationTableCacheEntry->replicationModel;
 		}
 	}
 
@@ -3295,6 +3282,11 @@ static DeferredErrorMessage *
 ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 {
 	Assert(queryTree->commandType == CMD_SELECT);
+
+	if (!queryTree->hasModifyingCTE)
+	{
+		return NULL;
+	}
 
 	/* we can't route conflicting replication models */
 	char replicationModel = 0;
