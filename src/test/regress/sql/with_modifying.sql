@@ -4,6 +4,8 @@ SET citus.next_shard_id TO 1502000;
 CREATE SCHEMA with_modifying;
 SET search_path TO with_modifying, public;
 
+CREATE TABLE with_modifying.local_table (id int, val int);
+
 CREATE TABLE with_modifying.modify_table (id int, val int);
 SELECT create_distributed_table('modify_table', 'id');
 
@@ -410,6 +412,17 @@ raw_data AS (
 )
 SELECT * FROM raw_data ORDER BY val;
 
+-- Test that local tables are barred
+UPDATE local_table lt SET val = mt.val
+FROM modify_table mt WHERE mt.id = lt.id;
+
+-- Including inside CTEs
+WITH cte AS (
+    UPDATE local_table lt SET val = mt.val
+    FROM modify_table mt WHERE mt.id = lt.id
+    RETURNING lt.id, lt.val
+) SELECT * FROM cte JOIN modify_table mt ON mt.id = cte.id ORDER BY 1,2;
+
 -- Test with replication factor 2
 SET citus.shard_replication_factor to 2;
 
@@ -444,4 +457,5 @@ ROLLBACK;
  WITH first_query AS (INSERT INTO modify_table (id) VALUES (10001)),
  	second_query AS (SELECT * FROM modify_table) SELECT count(*) FROM second_query;
 
+\set VERBOSITY terse
 DROP SCHEMA with_modifying CASCADE;

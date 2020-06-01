@@ -624,10 +624,30 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 
 			if (cteQuery->commandType != CMD_SELECT)
 			{
+				/* Modifying CTEs still not supported for INSERTs & multi shard queries. */
+				if (queryTree->commandType == CMD_INSERT)
+				{
+					return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+										 "Router planner doesn't support non-select common table expressions with non-select queries.",
+										 NULL, NULL);
+				}
+
+				if (multiShardQuery)
+				{
+					return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+										 "Router planner doesn't support non-select common table expressions with multi shard queries.",
+										 NULL, NULL);
+				}
+			}
+
+			/* Modifying CTEs exclude both INSERT CTEs & INSERT queries. */
+			if (cteQuery->commandType == CMD_INSERT)
+			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "Router planner doesn't support non-select common table expressions.",
+									 "Router planner doesn't support INSERT common table expressions.",
 									 NULL, NULL);
 			}
+
 
 			if (cteQuery->hasForUpdate &&
 				FindNodeCheckInRangeTableList(cteQuery->rtable, IsReferenceTableRTE))
@@ -646,10 +666,13 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 									 NULL, NULL);
 			}
 
-			DeferredErrorMessage *cteError = MultiRouterPlannableQuery(cteQuery);
-			if (cteError)
+			if (cteQuery->commandType == CMD_SELECT)
 			{
-				return cteError;
+				DeferredErrorMessage *cteError = MultiRouterPlannableQuery(cteQuery);
+				if (cteError)
+				{
+					return cteError;
+				}
 			}
 		}
 	}
@@ -3336,6 +3359,8 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 			}
 
 			replicationModel = modificationTableCacheEntry->replicationModel;
+
+			/* TODO: check that modify query supported */
 		}
 	}
 

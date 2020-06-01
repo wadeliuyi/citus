@@ -2,6 +2,7 @@
 SET citus.next_shard_id TO 1502000;
 CREATE SCHEMA with_modifying;
 SET search_path TO with_modifying, public;
+CREATE TABLE with_modifying.local_table (id int, val int);
 CREATE TABLE with_modifying.modify_table (id int, val int);
 SELECT create_distributed_table('modify_table', 'id');
  create_distributed_table
@@ -667,6 +668,17 @@ SELECT * FROM raw_data ORDER BY val;
 ---------------------------------------------------------------------
 (0 rows)
 
+-- Test that local tables are barred
+UPDATE local_table lt SET val = mt.val
+FROM modify_table mt WHERE mt.id = lt.id;
+ERROR:  cannot plan modifications of local tables involving distributed tables
+-- Including inside CTEs
+WITH cte AS (
+    UPDATE local_table lt SET val = mt.val
+    FROM modify_table mt WHERE mt.id = lt.id
+    RETURNING lt.id, lt.val
+) SELECT * FROM cte JOIN modify_table mt ON mt.id = cte.id ORDER BY 1,2;
+ERROR:  cannot plan modifications of local tables involving distributed tables
 -- Test with replication factor 2
 SET citus.shard_replication_factor to 2;
 DROP TABLE modify_table;
@@ -737,10 +749,6 @@ ROLLBACK;
      1
 (1 row)
 
+\set VERBOSITY terse
 DROP SCHEMA with_modifying CASCADE;
-NOTICE:  drop cascades to 5 other objects
-DETAIL:  drop cascades to table users_table
-drop cascades to table anchor_table
-drop cascades to function raise_failed_execution_cte(text)
-drop cascades to table modify_table
-drop cascades to table summary_table
+NOTICE:  drop cascades to 6 other objects
