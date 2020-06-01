@@ -125,6 +125,9 @@ static void CreateSingleTaskRouterSelectPlan(DistributedPlan *distributedPlan,
 											 plannerRestrictionContext);
 static Oid ResultRelationOidForQuery(Query *query);
 static bool IsTidColumn(Node *node);
+static DeferredErrorMessage * ModifyPartialQuerySupported(Query *queryTree, bool
+														  multiShardQuery,
+														  Oid *distributedTableId);
 static DeferredErrorMessage * MultiShardModifyQuerySupported(Query *originalQuery,
 															 PlannerRestrictionContext *
 															 plannerRestrictionContext);
@@ -532,28 +535,18 @@ IsTidColumn(Node *node)
 
 
 /*
- * ModifyQuerySupported returns NULL if the query only contains supported
- * features, otherwise it returns an error description.
- * Note that we need both the original query and the modified one because
- * different checks need different versions. In particular, we cannot
- * perform the ContainsReadIntermediateResultFunction check on the
- * rewritten query because it may have been replaced by a subplan,
- * while some of the checks for setting the partition column value rely
- * on the rewritten query.
+ * ModifyPartialQuerySupported implements a subset of what ModifyQuerySupported checks,
+ * that subset being what's necessary to check modifying CTEs for.
  */
-DeferredErrorMessage *
-ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuery,
-					 PlannerRestrictionContext *plannerRestrictionContext)
+static DeferredErrorMessage *
+ModifyPartialQuerySupported(Query *queryTree, bool multiShardQuery,
+							Oid *distributedTableIdOutput)
 {
 	uint32 rangeTableId = 1;
-	List *rangeTableList = NIL;
-	ListCell *rangeTableCell = NULL;
-	uint32 queryTableCount = 0;
 	CmdType commandType = queryTree->commandType;
-	bool fastPathRouterQuery =
-		plannerRestrictionContext->fastPathRestrictionContext->fastPathRouterQuery;
 
 	Oid distributedTableId = ModifyQueryResultRelationId(queryTree);
+	*distributedTableIdOutput = distributedTableId;
 	if (!IsCitusTable(distributedTableId))
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -568,30 +561,6 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 	if (deferredError != NULL)
 	{
 		return deferredError;
-	}
-
-	/*
-	 * Here, we check if a recursively planned query tries to modify
-	 * rows based on the ctid column. This is a bad idea because ctid of
-	 * the rows could be changed before the modification part of
-	 * the query is executed.
-	 *
-	 * We can exclude fast path queries since they cannot have intermediate
-	 * results by definition.
-	 */
-	if (!fastPathRouterQuery &&
-		ContainsReadIntermediateResultFunction((Node *) originalQuery))
-	{
-		bool hasTidColumn = FindNodeCheck((Node *) originalQuery->jointree, IsTidColumn);
-		if (hasTidColumn)
-		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "cannot perform distributed planning for the given "
-								 "modification",
-								 "Recursively planned distributed modifications "
-								 "with ctid on where clause are not supported.",
-								 NULL);
-		}
 	}
 
 	/*
@@ -677,6 +646,173 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 		}
 	}
 
+	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
+		commandType == CMD_DELETE)
+	{
+		bool hasVarArgument = false; /* A STABLE function is passed a Var argument */
+		bool hasBadCoalesce = false; /* CASE/COALESCE passed a mutable function */
+		FromExpr *joinTree = queryTree->jointree;
+		ListCell *targetEntryCell = NULL;
+
+		foreach(targetEntryCell, queryTree->targetList)
+		{
+			TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+			bool targetEntryPartitionColumn = false;
+
+			/* reference tables do not have partition column */
+			if (partitionColumn == NULL)
+			{
+				targetEntryPartitionColumn = false;
+			}
+			else if (targetEntry->resno == partitionColumn->varattno)
+			{
+				targetEntryPartitionColumn = true;
+			}
+
+			/* skip resjunk entries: UPDATE adds some for ctid, etc. */
+			if (targetEntry->resjunk)
+			{
+				continue;
+			}
+
+			if (commandType == CMD_UPDATE &&
+				FindNodeCheck((Node *) targetEntry->expr, CitusIsVolatileFunction))
+			{
+				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									 "functions used in UPDATE queries on distributed "
+									 "tables must not be VOLATILE",
+									 NULL, NULL);
+			}
+
+			if (commandType == CMD_UPDATE && targetEntryPartitionColumn &&
+				TargetEntryChangesValue(targetEntry, partitionColumn,
+										queryTree->jointree))
+			{
+				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									 "modifying the partition value of rows is not "
+									 "allowed",
+									 NULL, NULL);
+			}
+
+			if (commandType == CMD_UPDATE &&
+				MasterIrreducibleExpression((Node *) targetEntry->expr,
+											&hasVarArgument, &hasBadCoalesce))
+			{
+				Assert(hasVarArgument || hasBadCoalesce);
+			}
+		}
+
+		if (joinTree != NULL)
+		{
+			if (FindNodeCheck((Node *) joinTree->quals, CitusIsVolatileFunction))
+			{
+				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									 "functions used in the WHERE clause of modification "
+									 "queries on distributed tables must not be VOLATILE",
+									 NULL, NULL);
+			}
+			else if (MasterIrreducibleExpression(joinTree->quals, &hasVarArgument,
+												 &hasBadCoalesce))
+			{
+				Assert(hasVarArgument || hasBadCoalesce);
+			}
+		}
+
+		if (hasVarArgument)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "STABLE functions used in UPDATE queries "
+								 "cannot be called with column references",
+								 NULL, NULL);
+		}
+
+		if (hasBadCoalesce)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "non-IMMUTABLE functions are not allowed in CASE or "
+								 "COALESCE statements",
+								 NULL, NULL);
+		}
+
+		if (contain_mutable_functions((Node *) queryTree->returningList))
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "non-IMMUTABLE functions are not allowed in the "
+								 "RETURNING clause",
+								 NULL, NULL);
+		}
+
+		if (queryTree->jointree->quals != NULL &&
+			nodeTag(queryTree->jointree->quals) == T_CurrentOfExpr)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "cannot run DML queries with cursors", NULL,
+								 NULL);
+		}
+	}
+
+	deferredError = ErrorIfOnConflictNotSupported(queryTree);
+	if (deferredError != NULL)
+	{
+		return deferredError;
+	}
+
+	return NULL;
+}
+
+
+/*
+ * ModifyQuerySupported returns NULL if the query only contains supported
+ * features, otherwise it returns an error description.
+ * Note that we need both the original query and the modified one because
+ * different checks need different versions. In particular, we cannot
+ * perform the ContainsReadIntermediateResultFunction check on the
+ * rewritten query because it may have been replaced by a subplan,
+ * while some of the checks for setting the partition column value rely
+ * on the rewritten query.
+ */
+DeferredErrorMessage *
+ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuery,
+					 PlannerRestrictionContext *plannerRestrictionContext)
+{
+	Oid distributedTableId = InvalidOid;
+	DeferredErrorMessage *error = ModifyPartialQuerySupported(queryTree, multiShardQuery,
+															  &distributedTableId);
+	if (error)
+	{
+		return error;
+	}
+
+	List *rangeTableList = NIL;
+	uint32 queryTableCount = 0;
+	CmdType commandType = queryTree->commandType;
+	bool fastPathRouterQuery =
+		plannerRestrictionContext->fastPathRestrictionContext->fastPathRouterQuery;
+
+	/*
+	 * Here, we check if a recursively planned query tries to modify
+	 * rows based on the ctid column. This is a bad idea because ctid of
+	 * the rows could be changed before the modification part of
+	 * the query is executed.
+	 *
+	 * We can exclude fast path queries since they cannot have intermediate
+	 * results by definition.
+	 */
+	if (!fastPathRouterQuery &&
+		ContainsReadIntermediateResultFunction((Node *) originalQuery))
+	{
+		bool hasTidColumn = FindNodeCheck((Node *) originalQuery->jointree, IsTidColumn);
+		if (hasTidColumn)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "cannot perform distributed planning for the given "
+								 "modification",
+								 "Recursively planned distributed modifications "
+								 "with ctid on where clause are not supported.",
+								 NULL);
+		}
+	}
+
 	/*
 	 * Extract range table entries for queries that are not fast path. We can skip fast
 	 * path queries because their definition is a single RTE entry, which is a relation,
@@ -687,10 +823,9 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 		ExtractRangeTableEntryWalker((Node *) originalQuery, &rangeTableList);
 	}
 
-	foreach(rangeTableCell, rangeTableList)
+	RangeTblEntry *rangeTableEntry = NULL;
+	foreach_ptr(rangeTableEntry, rangeTableList)
 	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-
 		if (rangeTableEntry->rtekind == RTE_RELATION)
 		{
 			/* we do not expect to see a view in modify query */
@@ -808,117 +943,6 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 		{
 			return errorMessage;
 		}
-	}
-
-	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
-		commandType == CMD_DELETE)
-	{
-		bool hasVarArgument = false; /* A STABLE function is passed a Var argument */
-		bool hasBadCoalesce = false; /* CASE/COALESCE passed a mutable function */
-		FromExpr *joinTree = queryTree->jointree;
-		ListCell *targetEntryCell = NULL;
-
-		foreach(targetEntryCell, queryTree->targetList)
-		{
-			TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-			bool targetEntryPartitionColumn = false;
-
-			/* reference tables do not have partition column */
-			if (partitionColumn == NULL)
-			{
-				targetEntryPartitionColumn = false;
-			}
-			else if (targetEntry->resno == partitionColumn->varattno)
-			{
-				targetEntryPartitionColumn = true;
-			}
-
-			/* skip resjunk entries: UPDATE adds some for ctid, etc. */
-			if (targetEntry->resjunk)
-			{
-				continue;
-			}
-
-			if (commandType == CMD_UPDATE &&
-				FindNodeCheck((Node *) targetEntry->expr, CitusIsVolatileFunction))
-			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "functions used in UPDATE queries on distributed "
-									 "tables must not be VOLATILE",
-									 NULL, NULL);
-			}
-
-			if (commandType == CMD_UPDATE && targetEntryPartitionColumn &&
-				TargetEntryChangesValue(targetEntry, partitionColumn,
-										queryTree->jointree))
-			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "modifying the partition value of rows is not "
-									 "allowed",
-									 NULL, NULL);
-			}
-
-			if (commandType == CMD_UPDATE &&
-				MasterIrreducibleExpression((Node *) targetEntry->expr,
-											&hasVarArgument, &hasBadCoalesce))
-			{
-				Assert(hasVarArgument || hasBadCoalesce);
-			}
-		}
-
-		if (joinTree != NULL)
-		{
-			if (FindNodeCheck((Node *) joinTree->quals, CitusIsVolatileFunction))
-			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "functions used in the WHERE clause of modification "
-									 "queries on distributed tables must not be VOLATILE",
-									 NULL, NULL);
-			}
-			else if (MasterIrreducibleExpression(joinTree->quals, &hasVarArgument,
-												 &hasBadCoalesce))
-			{
-				Assert(hasVarArgument || hasBadCoalesce);
-			}
-		}
-
-		if (hasVarArgument)
-		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "STABLE functions used in UPDATE queries "
-								 "cannot be called with column references",
-								 NULL, NULL);
-		}
-
-		if (hasBadCoalesce)
-		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "non-IMMUTABLE functions are not allowed in CASE or "
-								 "COALESCE statements",
-								 NULL, NULL);
-		}
-
-		if (contain_mutable_functions((Node *) queryTree->returningList))
-		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "non-IMMUTABLE functions are not allowed in the "
-								 "RETURNING clause",
-								 NULL, NULL);
-		}
-
-		if (queryTree->jointree->quals != NULL &&
-			nodeTag(queryTree->jointree->quals) == T_CurrentOfExpr)
-		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "cannot run DML queries with cursors", NULL,
-								 NULL);
-		}
-	}
-
-	deferredError = ErrorIfOnConflictNotSupported(queryTree);
-	if (deferredError != NULL)
-	{
-		return deferredError;
 	}
 
 	return NULL;
