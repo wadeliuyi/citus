@@ -511,7 +511,12 @@ ResultRelationOidForQuery(Query *query)
 RangeTblEntry *
 ExtractResultRelationRTE(Query *query)
 {
-	return rt_fetch(query->resultRelation, query->rtable);
+	if (query->resultRelation > 0)
+	{
+		return rt_fetch(query->resultRelation, query->rtable);
+	}
+
+	return NULL;
 }
 
 
@@ -1098,8 +1103,7 @@ MultiShardModifyQuerySupported(Query *originalQuery,
 							   PlannerRestrictionContext *plannerRestrictionContext)
 {
 	DeferredErrorMessage *errorMessage = NULL;
-	RangeTblEntry *resultRangeTable = rt_fetch(originalQuery->resultRelation,
-											   originalQuery->rtable);
+	RangeTblEntry *resultRangeTable = ExtractResultRelationRTE(originalQuery);
 	Oid resultRelationOid = resultRangeTable->relid;
 	char resultPartitionMethod = PartitionMethod(resultRelationOid);
 
@@ -1951,49 +1955,6 @@ RowLocksOnRelations(Node *node, List **relationRowLockList)
 
 
 /*
- * SingleShardModifyTaskList generates a task for single shard update/delete query
- * and returns it as a list.
- */
-static List *
-SingleShardModifyTaskList(Query *query, uint64 jobId, List *relationShardList,
-						  List *placementList, uint64 shardId,
-						  bool parametersInQueryResolved)
-{
-	Task *task = CreateTask(MODIFY_TASK);
-	List *rangeTableList = NIL;
-
-	ExtractRangeTableEntryWalker((Node *) query, &rangeTableList);
-	RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(query);
-
-	CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
-		updateOrDeleteRTE->relid);
-	char modificationPartitionMethod = modificationTableCacheEntry->partitionMethod;
-
-	if (modificationPartitionMethod == DISTRIBUTE_BY_NONE &&
-		SelectsFromDistributedTable(rangeTableList, query))
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot perform select on a distributed table "
-							   "and modify a reference table")));
-	}
-
-	List *relationRowLockList = NIL;
-	RowLocksOnRelations((Node *) query, &relationRowLockList);
-
-	task->taskPlacementList = placementList;
-	SetTaskQueryIfShouldLazyDeparse(task, query);
-	task->anchorShardId = shardId;
-	task->jobId = jobId;
-	task->relationShardList = relationShardList;
-	task->relationRowLockList = relationRowLockList;
-	task->replicationModel = modificationTableCacheEntry->replicationModel;
-	task->parametersInQueryStringResolved = parametersInQueryResolved;
-
-	return list_make1(task);
-}
-
-
-/*
  * SelectsFromDistributedTable checks if there is a select on a distributed
  * table by looking into range table entries.
  */
@@ -2001,12 +1962,11 @@ static bool
 SelectsFromDistributedTable(List *rangeTableList, Query *query)
 {
 	ListCell *rangeTableCell = NULL;
-	int resultRelation = query->resultRelation;
 	RangeTblEntry *resultRangeTableEntry = NULL;
 
-	if (resultRelation > 0)
+	if (query->resultRelation > 0)
 	{
-		resultRangeTableEntry = rt_fetch(resultRelation, query->rtable);
+		resultRangeTableEntry = ExtractResultRelationRTE(query);
 	}
 
 	foreach(rangeTableCell, rangeTableList)
@@ -3361,9 +3321,16 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 
 		if (cteQuery->commandType != CMD_SELECT)
 		{
-			RangeTblEntry *updateOrDeleteRTE = ExtractResultRelationRTE(cteQuery);
-			CitusTableCacheEntry *modificationTableCacheEntry = GetCitusTableCacheEntry(
-				updateOrDeleteRTE->relid);
+			Oid distributedTableId = InvalidOid;
+			DeferredErrorMessage *cteError =
+				ModifyPartialQuerySupported(cteQuery, false, &distributedTableId);
+			if (cteError)
+			{
+				return cteError;
+			}
+
+			CitusTableCacheEntry *modificationTableCacheEntry =
+				GetCitusTableCacheEntry(distributedTableId);
 			char modificationPartitionMethod =
 				modificationTableCacheEntry->partitionMethod;
 
@@ -3383,8 +3350,6 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 			}
 
 			replicationModel = modificationTableCacheEntry->replicationModel;
-
-			/* TODO: check that modify query supported */
 		}
 	}
 

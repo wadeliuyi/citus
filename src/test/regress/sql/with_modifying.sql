@@ -423,6 +423,10 @@ WITH cte AS (
     RETURNING lt.id, lt.val
 ) SELECT * FROM cte JOIN modify_table mt ON mt.id = cte.id ORDER BY 1,2;
 
+-- Make sure checks for volatile functions apply to CTEs too
+WITH cte AS (UPDATE modify_table SET val = random() WHERE id = 3 RETURNING *)
+SELECT * FROM cte JOIN modify_table mt ON mt.id = 3 AND mt.id = cte.id ORDER BY 1,2;
+
 -- Test with replication factor 2
 SET citus.shard_replication_factor to 2;
 
