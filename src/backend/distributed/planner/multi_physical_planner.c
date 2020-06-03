@@ -1295,11 +1295,6 @@ QueryJoinTree(MultiNode *multiNode, List *dependentJobList, List **rangeTableLis
 				joinExpr->jointype = JOIN_LEFT;
 			}
 
-			RangeTblEntry *rangeTableEntry = JoinRangeTableEntry(joinExpr,
-																 dependentJobList,
-																 *rangeTableList);
-			*rangeTableList = lappend(*rangeTableList, rangeTableEntry);
-
 			/* fix the column attributes in ON (...) clauses */
 			List *columnList = pull_var_clause_default((Node *) joinNode->joinClauseList);
 			foreach(columnCell, columnList)
@@ -1314,6 +1309,11 @@ QueryJoinTree(MultiNode *multiNode, List *dependentJobList, List **rangeTableLis
 
 			/* make AND clauses explicit after fixing them */
 			joinExpr->quals = (Node *) make_ands_explicit(joinNode->joinClauseList);
+
+			RangeTblEntry *rangeTableEntry = JoinRangeTableEntry(joinExpr,
+																 dependentJobList,
+																 *rangeTableList);
+			*rangeTableList = lappend(*rangeTableList, rangeTableEntry);
 
 			return (Node *) joinExpr;
 		}
@@ -1472,16 +1472,28 @@ JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList, List *rangeTable
 	ExtractColumns(rightRTE, rightRangeTableId, dependentJobList,
 				   &rightColumnNames, &rightColumnVars);
 
+				   
+
 	joinedColumnNames = list_concat(joinedColumnNames, leftColumnNames);
 	joinedColumnVars = list_concat(joinedColumnVars, leftColumnVars);
 	joinedColumnNames = list_concat(joinedColumnNames, rightColumnNames);
 	joinedColumnVars = list_concat(joinedColumnVars, rightColumnVars);
 
+	Var* var;
+	foreach_ptr(var, leftColumnVars) {
+		rangeTableEntry->joinleftcols = lappend_int(rangeTableEntry->joinleftcols, var->varattno); 
+	} 
+
+	foreach_ptr(var, rightColumnVars) {
+		rangeTableEntry->joinrightcols = lappend_int(rangeTableEntry->joinrightcols, var->varattno); 
+	} 
+	
+
 	rangeTableEntry->eref->colnames = joinedColumnNames;
 	rangeTableEntry->joinaliasvars = joinedColumnVars;
 
-	SetJoinRelatedColumnsCompat(rangeTableEntry, joinExpr,
-	 leftColumnNames, rightColumnNames, leftColumnVars, rightColumnVars);
+	// SetJoinRelatedColumnsCompat(rangeTableEntry, joinExpr,
+	//  leftColumnNames, rightColumnNames, leftColumnVars, rightColumnVars);
 
 	return rangeTableEntry;
 }
@@ -1501,6 +1513,7 @@ static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, JoinExpr
 	int index = 0;
 	foreach(lx, l_colnames)
 	{
+
 		char	   *l_colname = strVal(lfirst(lx));
 		Value	   *m_name = NULL;
 
@@ -1511,7 +1524,7 @@ static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, JoinExpr
 		{
 			char	   *r_colname = strVal(lfirst(rx));
 
-			if (strcmp(l_colname, r_colname) == 0)
+			if (strcmp(l_colname, r_colname) == 0 && strcmp(l_colname, "id") == 0)
 			{
 				m_name = makeString(l_colname);
 				break;
