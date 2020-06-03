@@ -82,6 +82,14 @@
 int ReadFromSecondaries = USE_SECONDARY_NODES_NEVER;
 
 
+typedef struct CitusTableCacheEntrySlot
+{
+	/* lookup key - must be first. A pg_class.oid oid. */
+	Oid relationId;
+	CitusTableCacheEntry *data;
+} CitusTableCacheEntrySlot;
+
+
 /*
  * ShardIdIndexSlot is entry type for CitusTableCacheEntry's ShardIdIndexHash.
  */
@@ -151,6 +159,7 @@ static bool citusVersionKnownCompatible = false;
 
 /* Hash table for informations about each partition */
 static HTAB *DistTableCacheHash = NULL;
+static List *DistTableCacheExpired = NIL;
 
 /* Hash table for informations about each shard */
 static MemoryContext MetadataCacheMemoryContext = NULL;
@@ -819,31 +828,27 @@ LookupCitusTableCacheEntry(Oid relationId)
 		}
 	}
 
-	CitusTableCacheEntry *cacheEntry = hash_search(DistTableCacheHash, hashKey,
-												   HASH_ENTER,
-												   &foundInCache);
+	/*
+	 * We might have some concurrent metadata changes. In order to get the changes,
+	 * we first need to accept the cache invalidation messages.
+	 */
+	AcceptInvalidationMessages();
+	CitusTableCacheEntrySlot *cacheSlot =
+		hash_search(DistTableCacheHash, hashKey, HASH_ENTER, &foundInCache);
 
 	/* return valid matches */
 	if (foundInCache)
 	{
-		/*
-		 * We might have some concurrent metadata changes. In order to get the changes,
-		 * we first need to accept the cache invalidation messages.
-		 */
-		AcceptInvalidationMessages();
-
-		if (cacheEntry->isValid)
-		{
-			return cacheEntry;
-		}
-
-		/* free the content of old, invalid, entries */
-		ResetCitusTableCacheEntry(cacheEntry);
+		Assert(cacheSlot->data->isValid);
+		return cacheSlot->data;
 	}
 
 	/* zero out entry, but not the key part */
-	memset(((char *) cacheEntry) + sizeof(Oid), 0,
-		   sizeof(CitusTableCacheEntry) - sizeof(Oid));
+	memset(((char *) cacheSlot) + sizeof(Oid), 0,
+		   sizeof(CitusTableCacheEntrySlot) - sizeof(Oid));
+	cacheSlot->data =
+		MemoryContextAllocZero(MetadataCacheMemoryContext, sizeof(CitusTableCacheEntry));
+	cacheSlot->data->relationId = relationId;
 
 	/*
 	 * We disable interrupts while creating the cache entry because loading
@@ -854,14 +859,14 @@ LookupCitusTableCacheEntry(Oid relationId)
 	HOLD_INTERRUPTS();
 
 	/* actually fill out entry */
-	BuildCitusTableCacheEntry(cacheEntry);
+	BuildCitusTableCacheEntry(cacheSlot->data);
 
 	/* and finally mark as valid */
-	cacheEntry->isValid = true;
+	cacheSlot->data->isValid = true;
 
 	RESUME_INTERRUPTS();
 
-	return cacheEntry;
+	return cacheSlot->data;
 }
 
 
@@ -2823,8 +2828,7 @@ InitializeCaches(void)
 			RegisterForeignKeyGraphCacheCallbacks();
 			RegisterWorkerNodeCacheCallbacks();
 			RegisterLocalGroupIdCacheCallbacks();
-
-			/*RegisterCitusTableCacheEntryReleaseCallbacks(); */
+			RegisterCitusTableCacheEntryReleaseCallbacks();
 		}
 		PG_CATCH();
 		{
@@ -2837,6 +2841,7 @@ InitializeCaches(void)
 
 			MetadataCacheMemoryContext = NULL;
 			DistTableCacheHash = NULL;
+			DistTableCacheExpired = NIL;
 
 			PG_RE_THROW();
 		}
@@ -3294,6 +3299,8 @@ ResetCitusTableCacheEntry(CitusTableCacheEntry *cacheEntry)
 	cacheEntry->hasUninitializedShardInterval = false;
 	cacheEntry->hasUniformHashDistribution = false;
 	cacheEntry->hasOverlappingShardInterval = false;
+
+	pfree(cacheEntry);
 }
 
 
@@ -3355,11 +3362,14 @@ InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 		bool foundInCache = false;
 
 
-		CitusTableCacheEntry *cacheEntry = hash_search(DistTableCacheHash, hashKey,
-													   HASH_FIND, &foundInCache);
+		CitusTableCacheEntrySlot *cacheSlot =
+			hash_search(DistTableCacheHash, hashKey, HASH_REMOVE, &foundInCache);
 		if (foundInCache)
 		{
-			cacheEntry->isValid = false;
+			cacheSlot->data->isValid = false;
+			MemoryContext oldContext = MemoryContextSwitchTo(MetadataCacheMemoryContext);
+			DistTableCacheExpired = lappend(DistTableCacheExpired, cacheSlot->data);
+			MemoryContextSwitchTo(oldContext);
 		}
 
 		/*
@@ -3386,14 +3396,22 @@ InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 static void
 InvalidateDistTableCache(void)
 {
-	CitusTableCacheEntry *cacheEntry = NULL;
+	CitusTableCacheEntrySlot *cacheSlot = NULL;
 	HASH_SEQ_STATUS status;
 
 	hash_seq_init(&status, DistTableCacheHash);
 
-	while ((cacheEntry = (CitusTableCacheEntry *) hash_seq_search(&status)) != NULL)
+	while ((cacheSlot = (CitusTableCacheEntrySlot *) hash_seq_search(&status)) != NULL)
 	{
-		cacheEntry->isValid = false;
+		bool foundInCache = false;
+		CitusTableCacheEntrySlot *removedSlot PG_USED_FOR_ASSERTS_ONLY =
+			hash_search(DistTableCacheHash, cacheSlot, HASH_REMOVE, &foundInCache);
+		Assert(removedSlot == cacheSlot);
+
+		cacheSlot->data->isValid = false;
+		MemoryContext oldContext = MemoryContextSwitchTo(MetadataCacheMemoryContext);
+		DistTableCacheExpired = lappend(DistTableCacheExpired, cacheSlot->data);
+		MemoryContextSwitchTo(oldContext);
 	}
 }
 
@@ -3423,14 +3441,17 @@ InvalidateDistObjectCache(void)
 void
 FlushDistTableCache(void)
 {
-	CitusTableCacheEntry *cacheEntry = NULL;
+	CitusTableCacheEntrySlot *cacheSlot = NULL;
 	HASH_SEQ_STATUS status;
 
 	hash_seq_init(&status, DistTableCacheHash);
 
-	while ((cacheEntry = (CitusTableCacheEntry *) hash_seq_search(&status)) != NULL)
+	while ((cacheSlot = (CitusTableCacheEntrySlot *) hash_seq_search(&status)) != NULL)
 	{
-		ResetCitusTableCacheEntry(cacheEntry);
+		if (cacheSlot->data->isValid)
+		{
+			ResetCitusTableCacheEntry(cacheSlot->data);
+		}
 	}
 
 	hash_destroy(DistTableCacheHash);
@@ -3445,7 +3466,7 @@ CreateDistTableCache(void)
 	HASHCTL info;
 	MemSet(&info, 0, sizeof(info));
 	info.keysize = sizeof(Oid);
-	info.entrysize = sizeof(CitusTableCacheEntry);
+	info.entrysize = sizeof(CitusTableCacheEntrySlot);
 	info.hash = tag_hash;
 	info.hcxt = MetadataCacheMemoryContext;
 	DistTableCacheHash =
@@ -3605,33 +3626,23 @@ InvalidateLocalGroupIdRelationCacheCallback(Datum argument, Oid relationId)
 
 
 /*
- *
+ * CitusTableCacheEntryReleaseCallback frees invalidated cache entries.
  */
 static void
-CitusTableCacheEntryReleaseCallback(ResourceReleasePhase phase, bool isCommit, bool
-									isTopLevel, void *arg)
+CitusTableCacheEntryReleaseCallback(ResourceReleasePhase phase, bool isCommit,
+									bool isTopLevel, void *arg)
 {
 	/* Locks are released for top-level-commit or rollbacks */
-	if (phase == RESOURCE_RELEASE_LOCKS &&
-		(true || isTopLevel || !isCommit))
+	if (phase == RESOURCE_RELEASE_LOCKS && isTopLevel)
 	{
 		AcceptInvalidationMessages();
 
 		CitusTableCacheEntry *cacheEntry = NULL;
-		HASH_SEQ_STATUS status;
-
-		hash_seq_init(&status, DistTableCacheHash);
-
-		while ((cacheEntry = (CitusTableCacheEntry *) hash_seq_search(&status)) != NULL)
+		foreach_ptr(cacheEntry, DistTableCacheExpired)
 		{
-			if (!cacheEntry->isValid)
-			{
-				ResetCitusTableCacheEntry(cacheEntry);
-				CitusTableCacheEntry *removedEntry PG_USED_FOR_ASSERTS_ONLY =
-					hash_search(DistTableCacheHash, cacheEntry, HASH_REMOVE, NULL);
-				Assert(removedEntry == cacheEntry);
-			}
+			ResetCitusTableCacheEntry(cacheEntry);
 		}
+		DistTableCacheExpired = NIL;
 	}
 }
 
