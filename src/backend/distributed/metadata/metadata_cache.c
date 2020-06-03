@@ -3633,10 +3633,8 @@ CitusTableCacheEntryReleaseCallback(ResourceReleasePhase phase, bool isCommit,
 									bool isTopLevel, void *arg)
 {
 	/* Locks are released for top-level-commit or rollbacks */
-	if (phase == RESOURCE_RELEASE_LOCKS && isTopLevel)
+	if (DistTableCacheExpired != NIL && phase == RESOURCE_RELEASE_LOCKS && isTopLevel)
 	{
-		AcceptInvalidationMessages();
-
 		CitusTableCacheEntry *cacheEntry = NULL;
 		foreach_ptr(cacheEntry, DistTableCacheExpired)
 		{
