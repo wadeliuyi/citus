@@ -1516,6 +1516,9 @@ WITH r AS (
 SELECT count(distinct a) from r NATURAL JOIN ref_table;
 Custom Scan (Citus Adaptive) (actual rows=1 loops=1)
   ->  Distributed Subplan XXX_1
+        Intermediate Data Size: 220 bytes
+        Remote Workers: 2
+        Write Local: false
         ->  Custom Scan (Citus Adaptive) (actual rows=10 loops=1)
               Task Count: 3
               Tasks Shown: One of 3
@@ -1560,6 +1563,9 @@ WHERE EXISTS(SELECT random() FROM dist_table NATURAL JOIN ref_table);
 Aggregate (actual rows=1 loops=1)
   ->  Custom Scan (Citus Adaptive) (actual rows=10 loops=1)
         ->  Distributed Subplan XXX_1
+              Intermediate Data Size: 140 bytes
+              Remote Workers: 2
+              Write Local: false
               ->  Custom Scan (Citus Adaptive) (actual rows=10 loops=1)
                     Task Count: 3
                     Tasks Shown: One of 3

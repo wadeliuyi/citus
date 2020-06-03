@@ -251,6 +251,20 @@ ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es)
 			es->indent += 3;
 		}
 
+		if (es->analyze)
+		{
+			if (es->timing)
+			{
+				ExplainPropertyFloat("Subplan Time", "seconds", subPlan->duration, 2, es);
+			}
+
+			ExplainPropertyInteger("Intermediate Data Size", "bytes",
+								   subPlan->bytesSentPerWorker, es);
+			ExplainPropertyInteger("Remote Workers", NULL, subPlan->remoteWorkerCount,
+								   es);
+			ExplainPropertyBool("Write Local", subPlan->writeLocalFile, es);
+		}
+
 		INSTR_TIME_SET_ZERO(planduration);
 
 		ExplainOnePlan(plan, into, es, queryString, params, NULL, &planduration);

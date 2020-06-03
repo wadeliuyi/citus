@@ -20,6 +20,7 @@
 #include "distributed/transaction_management.h"
 #include "distributed/worker_manager.h"
 #include "executor/executor.h"
+#include "utils/datetime.h"
 
 
 int MaxIntermediateResult = 1048576; /* maximum size in KB the intermediate result can grow to */
@@ -73,7 +74,23 @@ ExecuteSubPlans(DistributedPlan *distributedPlan)
 			CreateRemoteFileDestReceiver(resultId, estate, remoteWorkerNodeList,
 										 entry->writeLocalFile);
 
+		TimestampTz startTimestamp = GetCurrentTimestamp();
+
 		ExecutePlanIntoDestReceiver(plannedStmt, params, copyDest);
+
+		/*
+		 * EXPLAIN ANALYZE instrumentations. Calculating these are very light-weight,
+		 * so always populate them regardless of EXPLAIN ANALYZE or not.
+		 */
+		long durationSeconds = 0.0;
+		int durationMsecs = 0;
+		TimestampDifference(startTimestamp, GetCurrentTimestamp(), &durationSeconds,
+							&durationMsecs);
+		subPlan->duration = durationSeconds + durationMsecs * 10e-6;
+
+		subPlan->bytesSentPerWorker = RemoteFileDestReceiverBytesSent(copyDest);
+		subPlan->remoteWorkerCount = list_length(remoteWorkerNodeList);
+		subPlan->writeLocalFile = entry->writeLocalFile;
 
 		SubPlanLevel--;
 		FreeExecutorState(estate);

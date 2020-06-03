@@ -461,6 +461,12 @@ typedef struct DistributedSubPlan
 
 	uint32 subPlanId;
 	PlannedStmt *plan;
+
+	/* EXPLAIN ANALYZE instrumentations */
+	uint64 bytesSentPerWorker;
+	uint32 remoteWorkerCount;
+	double duration;
+	bool writeLocalFile;
 } DistributedSubPlan;
 
 
