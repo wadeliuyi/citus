@@ -1562,86 +1562,32 @@ identify_join_columns(JoinExpr *j, RangeTblEntry *jrte,
 	colinfo->leftattnos = (int *) palloc0(numjoincols * sizeof(int));
 	colinfo->rightattnos = (int *) palloc0(numjoincols * sizeof(int));
 
-		/*
+	/*
 	 * Deconstruct RTE's joinleftcols/joinrightcols into desired format.
 	 * Recall that the column(s) merged due to USING are the first column(s)
 	 * of the join output.  We need not do anything special while scanning
 	 * joinleftcols, but while scanning joinrightcols we must distinguish
 	 * merged from unmerged columns.
 	 */
-	/* Scan the joinaliasvars list to identify simple column references */
-	int i = 0;
-	foreach(lc, jrte->joinaliasvars)
+	jcolno = 0;
+	foreach(lc, jrte->joinleftcols)
 	{
-		Var		   *aliasvar = (Var *) lfirst(lc);
+		int			leftattno = lfirst_int(lc);
 
-		/* get rid of any implicit coercion above the Var */
-		aliasvar = (Var *) strip_implicit_coercions((Node *) aliasvar);
+		colinfo->leftattnos[jcolno++] = leftattno;
+	}
+	rcolno = 0;
+	foreach(lc, jrte->joinrightcols)
+	{
+		int			rightattno = lfirst_int(lc);
 
-		if (aliasvar == NULL)
-		{
-			/* It's a dropped column; nothing to do here */
-		}
-		else if (IsA(aliasvar, Var))
-		{
-			Assert(aliasvar->varlevelsup == 0);
-			Assert(aliasvar->varattno != 0);
-			if (aliasvar->varnosyn == colinfo->leftrti)
-				colinfo->leftattnos[i] = aliasvar->varattnosyn;
-			else if (aliasvar->varnosyn == colinfo->rightrti)
-				colinfo->rightattnos[i] = aliasvar->varattnosyn;
-			else
-				elog(ERROR, "unexpected varno %d in JOIN RTE",
-					 aliasvar->varno);
-		}
-		else if (IsA(aliasvar, CoalesceExpr))
-		{
-			/*
-			 * It's a merged column in FULL JOIN USING.  Ignore it for now and
-			 * let the code below identify the merged columns.
-			 */
-		}
+		if (rcolno < jrte->joinmergedcols)	/* merged column? */
+			colinfo->rightattnos[rcolno] = rightattno;
 		else
-			elog(ERROR, "unrecognized node type in join alias vars: %d",
-				 (int) nodeTag(aliasvar));
-
-		i++;
+			colinfo->rightattnos[jcolno++] = rightattno;
+		rcolno++;
 	}
-	if (j->usingClause)
-	{
-		List	   *leftvars = NIL;
-		List	   *rightvars = NIL;
-		ListCell   *lc2;
-
-		/* Extract left- and right-side Vars from the qual expression */
-		flatten_join_using_qual(j->quals, &leftvars, &rightvars);
-		Assert(list_length(leftvars) == list_length(j->usingClause));
-		Assert(list_length(rightvars) == list_length(j->usingClause));
-
-		/* Mark the output columns accordingly */
-		i = 0;
-		forboth(lc, leftvars, lc2, rightvars)
-		{
-			Var		   *leftvar = (Var *) lfirst(lc);
-			Var		   *rightvar = (Var *) lfirst(lc2);
-
-			Assert(leftvar->varlevelsup == 0);
-			Assert(leftvar->varattno != 0);
-			if (leftvar->varnosyn != colinfo->leftrti)
-				elog(ERROR, "unexpected varno %d in JOIN USING qual",
-					 leftvar->varno);
-			colinfo->leftattnos[i] = leftvar->varattnosyn;
-
-			Assert(rightvar->varlevelsup == 0);
-			Assert(rightvar->varattno != 0);
-			if (rightvar->varnosyn != colinfo->rightrti)
-				elog(ERROR, "unexpected varno %d in JOIN USING qual",
-					 rightvar->varno);
-			colinfo->rightattnos[i] = rightvar->varattnosyn;
-
-			i++;
-		}
-	}
+	Assert(jcolno == numjoincols);
 }
 
 /*
@@ -3666,16 +3612,16 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 	 * backwards compatibility than anything else.  But it does have the
 	 * advantage of making plans more explicit.)
 	 */
-	if (var->varnosyn > 0 && dpns->plan == NULL)
-	{
-		varno = var->varnosyn;
-		varattno = var->varattnosyn;
-	}
-	else
-	{
+	// if (var->varnosyn > 0 && dpns->plan == NULL)
+	// {
+		// varno = var->varnosyn;
+		// varattno = var->varattnosyn;
+	// }
+	// else
+	// {
 		varno = var->varno;
 		varattno = var->varattno;
-	}
+	// }
 
 	/*
 	 * Try to find the relevant RTE in this rtable.  In a plan tree, it's
@@ -4079,16 +4025,16 @@ get_name_for_var_field(Var *var, int fieldno,
 	 * parse tree, prefer to use the syntactic referent.  Otherwise, fall back
 	 * on the semantic referent.  (See comments in get_variable().)
 	 */
-	if (var->varnosyn > 0 && dpns->plan == NULL)
-	{
-		varno = var->varnosyn;
-		varattno = var->varattnosyn;
-	}
-	else
-	{
+	// if (var->varnosyn > 0 && dpns->plan == NULL)
+	// {
+		// varno = var->varnosyn;
+		// varattno = var->varattnosyn;
+	// }
+	// else
+	// {
 		varno = var->varno;
 		varattno = var->varattno;
-	}
+	// }
 	/*
 	 * Try to find the relevant RTE in this rtable.  In a plan tree, it's
 	 * likely that varno is OUTER_VAR or INNER_VAR, in which case we must dig

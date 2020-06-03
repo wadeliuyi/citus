@@ -130,8 +130,10 @@ static List * QueryJoinClauseList(MultiNode *multiNode);
 static List * QueryFromList(List *rangeTableList);
 static Node * QueryJoinTree(MultiNode *multiNode, List *dependentJobList,
 							List **rangeTableList);
-static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, int joinMergedCols,
-	List *leftColumnVars, List *rightColumnVars);						
+static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, JoinExpr* j,
+	List *l_colnames, List *r_colnames, List* leftColVars, List* rightColVars);	
+static void extractRemainingColumns(List *src_colnames, List **src_colnos,
+	 List **col_names, List **joinaliasvars, List* src_vals);					
 static RangeTblEntry * JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList,
 										   List *rangeTableList);
 static int ExtractRangeTableId(Node *node);
@@ -1478,32 +1480,177 @@ JoinRangeTableEntry(JoinExpr *joinExpr, List *dependentJobList, List *rangeTable
 	rangeTableEntry->eref->colnames = joinedColumnNames;
 	rangeTableEntry->joinaliasvars = joinedColumnVars;
 
-	SetJoinRelatedColumnsCompat(rangeTableEntry, list_length(joinExpr->usingClause),
-	 leftColumnVars, rightColumnVars);
+	SetJoinRelatedColumnsCompat(rangeTableEntry, joinExpr,
+	 leftColumnNames, rightColumnNames, leftColumnVars, rightColumnVars);
 
 	return rangeTableEntry;
 }
 
-static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, int joinMergedCols,
-	List *leftColumnVars, List *rightColumnVars) {
+static void SetJoinRelatedColumnsCompat(RangeTblEntry *rangeTableEntry, JoinExpr* j,
+	List *l_colnames, List *r_colnames, List* leftColVars, List* rightColVars) {
 	#if PG_VERSION_NUM >= PG_VERSION_13
 
-	rangeTableEntry->joinmergedcols = joinMergedCols;
 
-	Var* var = NULL;
-	List* joinleftcols = NIL;
-	foreach_ptr(var, leftColumnVars) {
-		joinleftcols = lappend_int(joinleftcols, var->varno);
+	List	   *rlist = NIL;
+	ListCell   *lx;
+	ListCell   *rx;
+	List *joinAliasVars = NIL;
+	List *colNames = NIL;
+	Assert(j->usingClause == NIL);	/* shouldn't have USING() too */
+
+	int index = 0;
+	foreach(lx, l_colnames)
+	{
+		char	   *l_colname = strVal(lfirst(lx));
+		Value	   *m_name = NULL;
+
+		if (l_colname[0] == '\0')
+			continue;	/* ignore dropped columns */
+
+		foreach(rx, r_colnames)
+		{
+			char	   *r_colname = strVal(lfirst(rx));
+
+			if (strcmp(l_colname, r_colname) == 0)
+			{
+				m_name = makeString(l_colname);
+				break;
+			}
+		}
+
+		/* matched a right column? then keep as join column... */
+		if (m_name != NULL) {
+			rlist = lappend(rlist, m_name);
+			colNames = lappend(colNames, m_name);
+			joinAliasVars = lappend(joinAliasVars, list_nth(rangeTableEntry->joinaliasvars, index));
+		}
+		index++;
 	}
 
-	List* joinrightcols = NIL;
-	foreach_ptr(var, rightColumnVars) {
-		joinrightcols = lappend_int(joinrightcols, var->varno);
-	}
+	j->usingClause = rlist;
 
-	rangeTableEntry->joinleftcols = joinleftcols;
-	rangeTableEntry->joinrightcols = joinrightcols;
+	List *l_colnos = NIL;
+	List *r_colnos = NIL;
+	if (j->usingClause)
+		{
+			/*
+			 * JOIN/USING (or NATURAL JOIN, as transformed above). Transform
+			 * the list into an explicit ON-condition, and generate a list of
+			 * merged result columns.
+			 */
+			List	   *ucols = j->usingClause;
+			ListCell   *ucol;
+
+			Assert(j->quals == NULL);	/* shouldn't have ON() too */
+
+			foreach(ucol, ucols)
+			{
+				char	   *u_colname = strVal(lfirst(ucol));
+				ListCell   *col;
+				int			ndx;
+				int			l_index = -1;
+				int			r_index = -1;
+
+				Assert(u_colname[0] != '\0');
+
+				/* Find it in left input */
+				ndx = 0;
+				foreach(col, l_colnames)
+				{
+					char	   *l_colname = strVal(lfirst(col));
+
+					if (strcmp(l_colname, u_colname) == 0)
+					{
+						if (l_index >= 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+									 errmsg("common column name \"%s\" appears more than once in left table",
+											u_colname)));
+						l_index = ndx;
+					}
+					ndx++;
+				}
+				if (l_index < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("column \"%s\" specified in USING clause does not exist in left table",
+									u_colname)));
+				l_colnos = lappend_int(l_colnos, l_index + 1);
+
+				/* Find it in right input */
+				ndx = 0;
+				foreach(col, r_colnames)
+				{
+					char	   *r_colname = strVal(lfirst(col));
+
+					if (strcmp(r_colname, u_colname) == 0)
+					{
+						if (r_index >= 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+									 errmsg("common column name \"%s\" appears more than once in right table",
+											u_colname)));
+						r_index = ndx;
+					}
+					ndx++;
+				}
+				if (r_index < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("column \"%s\" specified in USING clause does not exist in right table",
+									u_colname)));
+				r_colnos = lappend_int(r_colnos, r_index + 1);
+			}
+		}
+	extractRemainingColumns(l_colnames, &l_colnos, &colNames, &joinAliasVars, leftColVars);
+	extractRemainingColumns(r_colnames, &r_colnos, &colNames, &joinAliasVars, rightColVars);	
+
+	rangeTableEntry->joinmergedcols = list_length(j->usingClause);
+	rangeTableEntry->joinleftcols = l_colnos;
+	rangeTableEntry->joinrightcols = r_colnos;
+	rangeTableEntry->eref->colnames = colNames;
+	rangeTableEntry->joinaliasvars = joinAliasVars;
 	#endif
+}
+
+
+static void
+extractRemainingColumns(List *src_colnames, List **src_colnos,
+	 List **col_names, List **joinaliasvars, List* src_vals)
+{
+	Bitmapset  *prevcols;
+	int			attnum;
+	ListCell   *lc;
+
+	/*
+	 * While we could just test "list_member_int(*src_colnos, attnum)" to
+	 * detect already-merged columns in the loop below, that would be O(N^2)
+	 * for a wide input table.  Instead build a bitmapset of just the merged
+	 * USING columns, which we won't add to within the main loop.
+	 */
+	prevcols = NULL;
+	foreach(lc, *src_colnos)
+	{
+		prevcols = bms_add_member(prevcols, lfirst_int(lc));
+	}
+
+	attnum = 0;
+	int index = 0;
+	foreach(lc, src_colnames)
+	{
+		char	   *colname = strVal(lfirst(lc));
+
+		attnum++;
+		/* Non-dropped and not already merged? */
+		if (colname[0] != '\0' && !bms_is_member(attnum, prevcols))
+		{
+			/* Yes, so emit it as next output column */
+			*joinaliasvars = lappend(*joinaliasvars, list_nth(src_vals, index));
+			*col_names = lappend(*col_names, makeString(colname));
+			*src_colnos = lappend_int(*src_colnos, attnum);
+		}
+		index++;
+	}
 }
 
 /*
