@@ -155,6 +155,7 @@ extern void EnsureFunctionOwner(Oid functionId);
 extern void EnsureSuperUser(void);
 extern void EnsureTableNotDistributed(Oid relationId);
 extern void EnsureReplicationSettings(Oid relationId, char replicationModel);
+extern void PostCreateTableOperations(Oid relationId);
 extern bool RegularTable(Oid relationId);
 extern char * ConstructQualifiedShardName(ShardInterval *shardInterval);
 extern uint64 GetFirstShardId(Oid relationId);

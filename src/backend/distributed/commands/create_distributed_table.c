@@ -370,11 +370,7 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	InsertIntoPgDistPartition(relationId, distributionMethod, distributionColumn,
 							  colocationId, replicationModel);
 
-	/* foreign tables does not support TRUNCATE trigger */
-	if (RegularTable(relationId))
-	{
-		CreateTruncateTrigger(relationId);
-	}
+	PostCreateTableOperations(relationId);
 
 	/*
 	 * If we are using master_create_distributed_table, we don't need to continue,
@@ -394,21 +390,6 @@ CreateDistributedTable(Oid relationId, Var *distributionColumn, char distributio
 	else if (distributionMethod == DISTRIBUTE_BY_NONE)
 	{
 		CreateReferenceTableShard(relationId);
-	}
-
-
-	if (ShouldSyncTableMetadata(relationId))
-	{
-		CreateTableMetadataOnWorkers(relationId);
-	}
-
-	/*
-	 * We've a custom way of foreign key graph invalidation,
-	 * see InvalidateForeignKeyGraph().
-	 */
-	if (TableReferenced(relationId) || TableReferencing(relationId))
-	{
-		InvalidateForeignKeyGraph();
 	}
 
 	/* if this table is partitioned table, distribute its partitions too */
@@ -994,6 +975,32 @@ EnsureRelationHasNoTriggers(Oid relationId)
 								  "triggers."),
 						errhint("Drop all the triggers on \"%s\" and retry.",
 								relationName)));
+	}
+}
+
+
+/* TODO: @onurctirtir: add comment here */
+void
+PostCreateTableOperations(Oid relationId)
+{
+	/* foreign tables do not support TRUNCATE trigger */
+	if (RegularTable(relationId))
+	{
+		CreateTruncateTrigger(relationId);
+	}
+
+	if (ShouldSyncTableMetadata(relationId))
+	{
+		CreateTableMetadataOnWorkers(relationId);
+	}
+
+	/*
+	 * We've a custom way of foreign key graph invalidation,
+	 * see InvalidateForeignKeyGraph().
+	 */
+	if (TableReferenced(relationId) || TableReferencing(relationId))
+	{
+		InvalidateForeignKeyGraph();
 	}
 }
 
