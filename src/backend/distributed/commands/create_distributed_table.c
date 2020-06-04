@@ -979,7 +979,14 @@ EnsureRelationHasNoTriggers(Oid relationId)
 }
 
 
-/* TODO: @onurctirtir: add comment here */
+/*
+ * PostCreateTableOperations performs common post-operations for citus table
+ * creation. This includes:
+ *  - To create citus truncate trigger on citus table.
+ *  - To sync metadata to mx nodes.
+ *  - To invalidate foreign key graph that citus maintains for foreign key
+ *    relationships between tables.
+ */
 void
 PostCreateTableOperations(Oid relationId)
 {

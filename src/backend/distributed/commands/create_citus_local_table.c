@@ -100,7 +100,10 @@ ErrorIfUnsupportedCreateCitusLocalTable(Relation relation)
 }
 
 
-/* TODO: @onurctirtir: add comment here */
+/*
+ * ErrorIfUnsupportedCitusLocalTableKind errors out if the relation kind of
+ * relation with relationId is not supported for citus local table creation.
+ */
 static void
 ErrorIfUnsupportedCitusLocalTableKind(Oid relationId)
 {
@@ -112,7 +115,7 @@ ErrorIfUnsupportedCitusLocalTableKind(Oid relationId)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot create citus local table \"%s\", citus local "
-							   "tables cannot be involved in a parent/child relationship ",
+							   "tables cannot be involved in inheritance relationships",
 							   relationName)));
 	}
 
@@ -120,7 +123,7 @@ ErrorIfUnsupportedCitusLocalTableKind(Oid relationId)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot create citus local table \"%s\", citus local "
-							   "tables cannot be partition of another table ",
+							   "tables cannot be partition of other tables",
 							   relationName)));
 	}
 
@@ -130,7 +133,7 @@ ErrorIfUnsupportedCitusLocalTableKind(Oid relationId)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot create citus local table \"%s\", only regular "
 							   "tables and foreign tables are supported for citus local "
-							   "tables", relationName)));
+							   "table creation", relationName)));
 	}
 }
 
@@ -210,11 +213,9 @@ CreateCitusLocalTable(Oid relationId)
 }
 
 
-/* TODO: @onurctirtir: improve comment here */
-
 /*
- * Get necessary commands to recreate the shell table before renaming the
- * given relation to the shard relation.
+ * GetShellTableDDLEventsForCitusLocalTable returns a list of DDL commands
+ * to create the shell table from scratch.
  */
 static List *
 GetShellTableDDLEventsForCitusLocalTable(Oid relationId)
