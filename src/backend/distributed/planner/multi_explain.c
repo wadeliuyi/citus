@@ -56,10 +56,20 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 
+
+#define SET_PARAMS_MAGIC_STRING "CITUS_SET_EXPLAIN_ANALYZE_PARAMS_MAGIC"
+#define GET_EXPLAIN_ANALYZE_MAGIC_STRING "CITUS_GET_EXPLAIN_ANALYZE_MAGIC"
+
 /* Config variables that enable printing distributed query plans */
 bool ExplainDistributedQueries = true;
 bool ExplainAllTasks = false;
 bool ExplainWorkerQuery = false;
+
+typedef struct ExplainAnalyzePrivate
+{
+	bool explainAnalyzeUdfsInstalled;
+	Task *unmodifiedTask;
+} ExplainAnalyzePrivate;
 
 /* struct to save explain flags */
 typedef struct
@@ -116,10 +126,10 @@ static void ExplainTask(Task *task, int placementIndex, List *explainOutputList,
 static void ExplainTaskPlacement(ShardPlacement *taskPlacement, List *explainOutputList,
 								 ExplainState *es);
 static StringInfo BuildRemoteExplainQuery(const char *queryString, ExplainState *es);
-static void ExplainAnalyzePreExecutionHook(Task *task, int placementIndex,
-										   MultiConnection *connection);
-static void ExplainAnalyzePostExecutionHook(Task *task, int placementIndex,
-											MultiConnection *connection);
+static void ExplainAnalyzePreExecutionHook(Task *task, int placementIndex);
+static ResultConsumerAction ExplainAnalyzeResultConsumerHook(Task *task, int
+															 placementIndex,
+															 PGresult *result);
 static List * SplitString(StringInfo str, char delimiter);
 
 /* Static Explain functions copied from explain.c */
@@ -495,16 +505,6 @@ RemoteExplain(Task *task, ExplainState *es)
 		/* read explain query results */
 		remotePlan->explainOutputList = ReadFirstColumnAsText(queryResult);
 
-		/* if requested, add query text to explain output */
-		if (ExplainWorkerQuery)
-		{
-			StringInfo queryTextStr = makeStringInfo();
-			appendStringInfo(queryTextStr, "Query Text: %s", queryText);
-
-			remotePlan->explainOutputList = lcons(queryTextStr,
-												  remotePlan->explainOutputList);
-		}
-
 		PQclear(queryResult);
 		ForgetResults(connection);
 
@@ -530,6 +530,15 @@ ExplainTask(Task *task, int placementIndex, List *explainOutputList, ExplainStat
 		appendStringInfoSpaces(es->str, es->indent * 2);
 		appendStringInfo(es->str, "->  Task\n");
 		es->indent += 3;
+	}
+
+	if (ExplainWorkerQuery)
+	{
+		Task *unmodifiedTask = es->analyze ? task->explainAnalyzePrivate->unmodifiedTask :
+							   task;
+		const char *queryText = TaskQueryStringForPlacement(unmodifiedTask,
+															placementIndex);
+		ExplainPropertyText("Query Text", queryText, es);
 	}
 
 	if (explainOutputList != NIL)
@@ -730,11 +739,6 @@ SaveQueryExplainAnalyze(QueryDesc *queryDesc)
 
 	ExplainBeginOutput(es);
 
-	if (WorkerQueryExplainOptions.query)
-	{
-		ExplainQueryText(es, queryDesc);
-	}
-
 	ExplainPrintPlan(es, queryDesc);
 
 	if (es->costs)
@@ -780,6 +784,34 @@ RequestedForExplainAnalyze(CustomScanState *node)
 }
 
 
+static char *
+ExplainAnalyzeSetParamsQuery(bool enabled)
+{
+	StringInfo query = makeStringInfo();
+	appendStringInfo(query,
+					 "SELECT %s, worker_save_query_explain_analyze(%s, %s, %s, %s, %s, %s, %d)",
+					 quote_literal_cstr(SET_PARAMS_MAGIC_STRING),
+					 enabled ? "true" : "false",
+					 CurrentDistributedQueryExplainOptions.verbose ? "true" : "false",
+					 CurrentDistributedQueryExplainOptions.costs ? "true" : "false",
+					 CurrentDistributedQueryExplainOptions.timing ? "true" : "false",
+					 CurrentDistributedQueryExplainOptions.summary ? "true" : "false",
+					 CurrentDistributedQueryExplainOptions.query ? "true" : "false",
+					 (int) CurrentDistributedQueryExplainOptions.format);
+	return query->data;
+}
+
+
+static char *
+ExplainAnalyzeFetchQuery(void)
+{
+	StringInfo query = makeStringInfo();
+	appendStringInfo(query, "SELECT %s, worker_last_saved_explain_analyze()",
+					 quote_literal_cstr(GET_EXPLAIN_ANALYZE_MAGIC_STRING));
+	return query->data;
+}
+
+
 /*
  * InstallExplainAnalyzeHooks installs hooks on given tasks so EXPLAIN ANALYZE
  * output of them are saved & fetched from workers.
@@ -791,71 +823,71 @@ InstallExplainAnalyzeHooks(List *taskList)
 	foreach_ptr(task, taskList)
 	{
 		task->preExecutionHook = ExplainAnalyzePreExecutionHook;
-		task->postExecutionHook = ExplainAnalyzePostExecutionHook;
+		task->resultConsumerHook = ExplainAnalyzeResultConsumerHook;
+		task->explainAnalyzePrivate = palloc0(sizeof(ExplainAnalyzePrivate));
+		task->explainAnalyzePrivate->unmodifiedTask = copyObject(task);
 	}
 }
 
 
 /*
- * ExplainAnalyzePreExecutionHook implements task->preExecutionHook and sends
- * EXPLAIN ANALYZE params over the given connection.
+ * ExplainAnalyzePreExecutionHook implements task->preExecutionHook and adds
+ * worker_save_query_explain_analyze and worker_last_saved_explain_analyze
+ * calls to the task.
  */
 static void
-ExplainAnalyzePreExecutionHook(Task *task, int placementIndex,
-							   MultiConnection *connection)
+ExplainAnalyzePreExecutionHook(Task *task, int placementIndex)
 {
-	StringInfo query = makeStringInfo();
-	appendStringInfo(query,
-					 "SELECT worker_save_query_explain_analyze(true, %s, %s, %s, %s, %s, %d)",
-					 CurrentDistributedQueryExplainOptions.verbose ? "true" : "false",
-					 CurrentDistributedQueryExplainOptions.costs ? "true" : "false",
-					 CurrentDistributedQueryExplainOptions.timing ? "true" : "false",
-					 CurrentDistributedQueryExplainOptions.summary ? "true" : "false",
-					 CurrentDistributedQueryExplainOptions.query ? "true" : "false",
-					 (int) CurrentDistributedQueryExplainOptions.format);
-
-	ExecuteCriticalRemoteCommand(connection, query->data);
-}
-
-
-/*
- * ExplainAnalyzePostExecutionHook implements task->postExecutionHook and fetches the task's
- * EXPLAIN ANALYZE output from the worker.
- */
-static void
-ExplainAnalyzePostExecutionHook(Task *task, int placementIndex,
-								MultiConnection *connection)
-{
-	PGresult *planResult = NULL;
-	const char *fetchQuery = "SELECT worker_last_saved_explain_analyze()";
-
-	int execResult = ExecuteOptionalRemoteCommand(connection, fetchQuery, &planResult);
-	if (execResult == RESPONSE_OKAY)
-	{
-		List *planList = ReadFirstColumnAsText(planResult);
-		StringInfo remotePlan = (StringInfo) linitial(planList);
-
-		task->savedPlan = makeStringInfo();
-		appendStringInfoString(task->savedPlan, remotePlan->data);
-
-		task->savedPlanPlacementIndex = placementIndex;
-
-		PQclear(planResult);
-	}
-	else
-	{
-		ereport(ERROR, (errmsg("failed to fetch remote task's EXPLAIN ANALYZE")));
-	}
-
-	ClearResults(connection, false);
+	ExplainAnalyzePrivate *private = task->explainAnalyzePrivate;
 
 	/*
-	 * Disable worker EXPLAIN/ANALYZE, so we don't do save EXPLAIN ANALYZE output
-	 * in workers for subsequent queries if not asked to.
+	 * This can be called for multiple placements of the same task. Restore
+	 * taskQuery before modifying it again.
 	 */
-	const char *resetQuery = "SELECT worker_save_query_explain_analyze("
-							 "false, false, false, false, false, false, 0)";
-	ExecuteCriticalRemoteCommand(connection, resetQuery);
+	task->taskQuery = private->unmodifiedTask->taskQuery;
+
+	char *setParamsQuery = ExplainAnalyzeSetParamsQuery(true);
+	char *taskQuery = TaskQueryStringForPlacement(task, placementIndex);
+	char *fetchQuery = ExplainAnalyzeFetchQuery();
+	SetTaskQueryStringList(task, list_make3(setParamsQuery, taskQuery, fetchQuery));
+
+	private->explainAnalyzeUdfsInstalled = true;
+}
+
+
+/*
+ * ExplainAnalyzeResultConsumerHook implements task->resultConsumerHook.
+ * It consumes the results of worker_save_query_explain_analyze and
+ * worker_last_saved_explain_analyze, and does nothing for other results.
+ */
+static ResultConsumerAction
+ExplainAnalyzeResultConsumerHook(Task *task, int placementIndex,
+								 PGresult *result)
+{
+	Assert(PQresultStatus(result) == PGRES_SINGLE_TUPLE);
+
+	if (PQntuples(result) != 1 || PQnfields(result) != 2)
+	{
+		return RESULT_CONSUMER_ACTION_NONE;
+	}
+
+	char *magic = PQgetvalue(result, 0, 0);
+	if (strncmp(magic, SET_PARAMS_MAGIC_STRING, strlen(SET_PARAMS_MAGIC_STRING)) == 0)
+	{
+		return RESULT_CONSUMER_ACTION_CONSUME_CURRENT_SET;
+	}
+
+	if (strncmp(magic, GET_EXPLAIN_ANALYZE_MAGIC_STRING, strlen(
+					GET_EXPLAIN_ANALYZE_MAGIC_STRING)) == 0)
+	{
+		task->savedPlan = makeStringInfo();
+		appendStringInfoString(task->savedPlan, PQgetvalue(result, 0, 1));
+
+		return RESULT_CONSUMER_ACTION_CONSUME_CURRENT_SET;
+	}
+
+	/* not our result, just return the original result */
+	return RESULT_CONSUMER_ACTION_NONE;
 }
 
 

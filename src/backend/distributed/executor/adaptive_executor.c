@@ -696,7 +696,6 @@ AdaptiveExecutor(CitusScanState *scanState)
 		distributedPlan->modLevel, taskList,
 		hasDependentJobs);
 
-
 	DistributedExecution *execution = CreateDistributedExecution(
 		distributedPlan->modLevel,
 		taskList,
@@ -3061,14 +3060,7 @@ TransactionStateMachine(WorkerSession *session)
 				if (session->currentTask != NULL)
 				{
 					TaskPlacementExecution *placementExecution = session->currentTask;
-					Task *task = placementExecution->shardCommandExecution->task;
 					bool succeeded = true;
-
-					if (task->postExecutionHook != NULL)
-					{
-						int placementIndex = placementExecution->placementExecutionIndex;
-						task->postExecutionHook(task, placementIndex, connection);
-					}
 
 					/*
 					 * Once we finished a task on a connection, we no longer
@@ -3343,8 +3335,7 @@ StartPlacementExecutionOnSession(TaskPlacementExecution *placementExecution,
 
 	if (task->preExecutionHook != NULL)
 	{
-		task->preExecutionHook(task, placementExecution->placementExecutionIndex,
-							   connection);
+		task->preExecutionHook(task, placementExecution->placementExecutionIndex);
 	}
 
 	char *queryString = TaskQueryStringForPlacement(task,
@@ -3423,6 +3414,8 @@ ReceiveResults(WorkerSession *session, bool storeRows)
 	bool fetchDone = false;
 	MultiConnection *connection = session->connection;
 	WorkerPool *workerPool = session->workerPool;
+	TaskPlacementExecution *placementExecution = session->currentTask;
+	Task *task = placementExecution->shardCommandExecution->task;
 	DistributedExecution *execution = workerPool->distributedExecution;
 	DistributedExecutionStats *executionStats = execution->executionStats;
 	TupleDesc tupleDescriptor = execution->tupleDescriptor;
@@ -3480,8 +3473,8 @@ ReceiveResults(WorkerSession *session, bool storeRows)
 			PQclear(result);
 
 			/* no more results, break out of loop and free allocated memory */
-			fetchDone = true;
-			break;
+			fetchDone = false;
+			continue;
 		}
 		else if (resultStatus == PGRES_TUPLES_OK)
 		{
@@ -3492,13 +3485,38 @@ ReceiveResults(WorkerSession *session, bool storeRows)
 			Assert(PQntuples(result) == 0);
 			PQclear(result);
 
-			fetchDone = true;
-			break;
+			fetchDone = false;
+			continue;
 		}
 		else if (resultStatus != PGRES_SINGLE_TUPLE)
 		{
 			/* query failures are always hard errors */
 			ReportResultError(connection, result, ERROR);
+		}
+		else if (task->resultConsumerHook)
+		{
+			ResultConsumerAction action = task->resultConsumerHook(task, 0, result);
+			if (action == RESULT_CONSUMER_ACTION_CONSUME_CURRENT_SET)
+			{
+				/*
+				 * Consumer hook asked us to ignore current result set. Consume until
+				 * we hit PGRES_TUPLES_OK.
+				 */
+				PQclear(result);
+
+				while ((result = PQgetResult(connection->pgConn)) != NULL)
+				{
+					resultStatus = PQresultStatus(result);
+					PQclear(result);
+
+					if (resultStatus == PGRES_TUPLES_OK)
+					{
+						break;
+					}
+				}
+
+				continue;
+			}
 		}
 		else if (!storeRows)
 		{
@@ -3509,6 +3527,7 @@ ReceiveResults(WorkerSession *session, bool storeRows)
 			PQclear(result);
 			continue;
 		}
+
 
 		rowsProcessed = PQntuples(result);
 		uint32 columnCount = PQnfields(result);

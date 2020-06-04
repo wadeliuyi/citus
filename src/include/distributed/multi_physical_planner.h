@@ -29,6 +29,7 @@
 #include "distributed/multi_logical_planner.h"
 #include "distributed/distributed_planner.h"
 #include "lib/stringinfo.h"
+#include "libpq-fe.h"
 #include "nodes/parsenodes.h"
 #include "utils/array.h"
 
@@ -264,6 +265,13 @@ typedef struct TaskQuery
 
 typedef struct MultiConnection MultiConnection;
 typedef struct Task Task;
+typedef struct ExplainAnalyzePrivate ExplainAnalyzePrivate;
+
+typedef enum ResultConsumerAction
+{
+	RESULT_CONSUMER_ACTION_NONE,
+	RESULT_CONSUMER_ACTION_CONSUME_CURRENT_SET
+} ResultConsumerAction;
 
 typedef struct Task
 {
@@ -280,6 +288,7 @@ typedef struct Task
 
 	StringInfo savedPlan;
 	int savedPlanPlacementIndex;
+	ExplainAnalyzePrivate *explainAnalyzePrivate;
 
 	Oid anchorDistributedTableId;     /* only applies to insert tasks */
 	uint64 anchorShardId;       /* only applies to compute tasks */
@@ -336,9 +345,9 @@ typedef struct Task
 	 * these are used for EXPLAIN ANALYZE. "connection" is the connection on which
 	 * task is executed.
 	 */
-	void (*preExecutionHook)(Task *task, int placementIndex, MultiConnection *connection);
-	void (*postExecutionHook)(Task *task, int placementIndex,
-							  MultiConnection *connection);
+	void (*preExecutionHook)(Task *task, int placementIndex);
+	ResultConsumerAction (*resultConsumerHook)(Task *task, int placementIndex,
+											   PGresult *result);
 } Task;
 
 

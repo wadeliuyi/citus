@@ -304,9 +304,9 @@ Sort (actual rows=50 loops=1)
               Task Count: 2
               Tasks Shown: One of 2
               ->  Task
+                    Query Text: SELECT 'CITUS_SET_EXPLAIN_ANALYZE_PARAMS_MAGIC', worker_save_query_explain_analyze(true, false, false, false, false, true, 0);SELECT l_quantity, count(*) AS count_quantity FROM lineitem_290000 lineitem WHERE true GROUP BY l_quantity;SELECT 'CITUS_GET_EXPLAIN_ANALYZE_MAGIC', worker_last_saved_explain_analyze()
                     Node: host=localhost port=xxxxx dbname=regression
-                    ->  Query Text: SELECT l_quantity, count(*) AS count_quantity FROM lineitem_290000 lineitem WHERE true GROUP BY l_quantity
-                        HashAggregate (actual rows=50 loops=1)
+                    ->  HashAggregate (actual rows=50 loops=1)
                           Group Key: l_quantity
                           ->  Seq Scan on lineitem_290000 lineitem (actual rows=6000 loops=1)
 END;
@@ -324,9 +324,9 @@ Sort
               Task Count: 2
               Tasks Shown: One of 2
               ->  Task
+                    Query Text: SELECT l_quantity, count(*) AS count_quantity FROM lineitem_290000 lineitem WHERE true GROUP BY l_quantity
                     Node: host=localhost port=xxxxx dbname=regression
-                    ->  Query Text: SELECT l_quantity, count(*) AS count_quantity FROM lineitem_290000 lineitem WHERE true GROUP BY l_quantity
-                        HashAggregate
+                    ->  HashAggregate
                           Group Key: l_quantity
                           ->  Seq Scan on lineitem_290000 lineitem
 END;
